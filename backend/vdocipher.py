@@ -25,19 +25,8 @@ async def generate_otp(
     if not VDOCIPHER_API_SECRET:
         raise ValueError("VDOCIPHER_API_SECRET is not configured")
 
-    # Forensic watermark with viewer identity + device fingerprint
-    watermark = {
-        "type": "rtext",
-        "text": f"{user.email}|{user.user_id}|{device_fingerprint[:8]}",
-        "alpha": "0.50",
-        "color": "0xFFFFFF",
-        "size": "15",
-        "interval": "5000",
-    }
-
     body: dict = {
         "ttl": 300,  # 5-minute token lifetime
-        "annotate": json.dumps([watermark]),
     }
 
     # IP geo-restriction: bind OTP to viewer's current IP
