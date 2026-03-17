@@ -6,7 +6,10 @@ load_dotenv()
 VDOCIPHER_API_SECRET = os.getenv("VDOCIPHER_API_SECRET", "")
 VDOCIPHER_API_BASE = "https://dev.vdocipher.com/api"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-change-me")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+# Comma-separated list of allowed frontend origins
+FRONTEND_URLS = [
+    u.strip() for u in os.getenv("FRONTEND_URL", "http://localhost:3000").split(",") if u.strip()
+]
 ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "")
 
 # ─── Anti-Piracy Settings ────────────────────────────────────────────────

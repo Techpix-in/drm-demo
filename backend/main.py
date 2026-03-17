@@ -3,7 +3,7 @@ import asyncio
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import FRONTEND_URL, MAX_CONCURRENT_STREAMS
+from config import FRONTEND_URLS, MAX_CONCURRENT_STREAMS
 from models import (
     LoginRequest,
     LoginResponse,
@@ -46,7 +46,7 @@ app = FastAPI(title="SecureStream API", version="2.0.0")
 # CORS - allow the Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=FRONTEND_URLS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
