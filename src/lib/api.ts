@@ -182,20 +182,29 @@ class ApiClient {
       otp: string;
       playback_info: string;
       session_id: string;
+      tier: string;
+      max_resolution: string;
     }>("/api/video/otp", {
       method: "POST",
-      body: JSON.stringify({ video_id: videoId }),
+      body: JSON.stringify({ video_id: videoId, client_tier: "browser" }),
     });
   }
 
-  async sendHeartbeat(sessionId: string) {
-    return this.request<{ status: string; expires_in: number }>(
-      "/api/playback/heartbeat",
-      {
-        method: "POST",
-        body: JSON.stringify({ session_id: sessionId }),
-      }
-    );
+  async sendHeartbeat(
+    sessionId: string,
+    playbackEvents: Record<string, number> = {}
+  ) {
+    return this.request<{
+      status: string;
+      expires_in: number;
+      risk_level: string;
+    }>("/api/playback/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        playback_events: playbackEvents,
+      }),
+    });
   }
 
   async endSession(sessionId: string) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { api } from "@/lib/api";
 
 interface VdoPlayerProps {
@@ -12,8 +12,34 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
   const [playbackInfo, setPlaybackInfo] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [tier, setTier] = useState<string>("browser");
+  const [maxRes, setMaxRes] = useState<string>("480p");
   const sessionIdRef = useRef<string | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Behavioral tracking refs
+  const seekCountRef = useRef(0);
+  const restartCountRef = useRef(0);
+  const playSecondsRef = useRef(0);
+  const lastHeartbeatTimeRef = useRef(Date.now());
+
+  // Track seeks via iframe message events
+  const handleMessage = useCallback((event: MessageEvent) => {
+    if (event.origin !== "https://player.vdocipher.com") return;
+    try {
+      const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+      if (data.event === "seeked" || data.event === "seeking") {
+        seekCountRef.current += 1;
+      }
+    } catch {
+      // not a JSON message, ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [handleMessage]);
 
   useEffect(() => {
     async function fetchOTP() {
@@ -21,17 +47,42 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
         const data = await api.getOTP(videoId);
         setOtp(data.otp);
         setPlaybackInfo(data.playback_info);
+        setTier(data.tier || "browser");
+        setMaxRes(data.max_resolution || "480p");
         sessionIdRef.current = data.session_id;
+        lastHeartbeatTimeRef.current = Date.now();
 
-        // Start heartbeat every 30 seconds
-        heartbeatRef.current = setInterval(() => {
-          if (sessionIdRef.current) {
-            api.sendHeartbeat(sessionIdRef.current).catch(() => {
-              // Session expired or invalid, stop heartbeat
-              if (heartbeatRef.current) {
-                clearInterval(heartbeatRef.current);
-              }
-            });
+        // Start heartbeat every 30 seconds with behavioral events
+        heartbeatRef.current = setInterval(async () => {
+          if (!sessionIdRef.current) return;
+
+          const now = Date.now();
+          const elapsed = (now - lastHeartbeatTimeRef.current) / 1000;
+          lastHeartbeatTimeRef.current = now;
+
+          const events = {
+            seek_count: seekCountRef.current,
+            restart_count: restartCountRef.current,
+            play_seconds: Math.round(elapsed),
+          };
+
+          // Reset counters after sending
+          seekCountRef.current = 0;
+          restartCountRef.current = 0;
+
+          try {
+            const result = await api.sendHeartbeat(
+              sessionIdRef.current,
+              events
+            );
+            if (result.risk_level === "blocked") {
+              setError(
+                "Playback suspended due to unusual activity. Please try again later."
+              );
+              if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+            }
+          } catch {
+            if (heartbeatRef.current) clearInterval(heartbeatRef.current);
           }
         }, 30000);
       } catch (err) {
@@ -43,11 +94,8 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
 
     fetchOTP();
 
-    // Cleanup: stop heartbeat and end session on unmount
     return () => {
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current);
-      }
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
       if (sessionIdRef.current) {
         api.endSession(sessionIdRef.current).catch(() => {});
       }
@@ -77,13 +125,17 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
   }
 
   return (
-    <div className="aspect-video bg-black rounded-lg overflow-hidden">
+    <div className="aspect-video bg-black rounded-lg overflow-hidden relative">
       <iframe
         src={`https://player.vdocipher.com/v2/?otp=${otp}&playbackInfo=${playbackInfo}`}
         style={{ width: "100%", height: "100%", border: 0 }}
         allow="encrypted-media"
         allowFullScreen
       />
+      {/* Tier badge — shows resolution cap */}
+      <div className="absolute top-3 right-3 bg-black/60 text-xs text-gray-300 px-2 py-1 rounded">
+        {tier === "browser" ? `Browser · Max ${maxRes}` : `${tier} · ${maxRes}`}
+      </div>
     </div>
   );
 }

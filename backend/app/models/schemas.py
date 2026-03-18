@@ -12,12 +12,15 @@ class Video(BaseModel):
 
 class OTPRequest(BaseModel):
     video_id: str
+    client_tier: str = "browser"
 
 
 class OTPResponse(BaseModel):
     otp: str
     playback_info: str
     session_id: str
+    tier: str
+    max_resolution: str
 
 
 class LoginRequest(BaseModel):
@@ -47,11 +50,13 @@ class RefreshResponse(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     session_id: str
+    playback_events: dict = {}
 
 
 class HeartbeatResponse(BaseModel):
     status: str
     expires_in: int
+    risk_level: str = "normal"
 
 
 class PlaybackSession(BaseModel):
