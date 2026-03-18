@@ -5,6 +5,13 @@ services:
       - "8000:8000"
     env_file:
       - ./backend/.env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    networks:
+      - postgres-server_default
+      - redis-docker_default
+
+networks:
+  postgres-server_default:
+    external: true
+  redis-docker_default:
+    external: true
