@@ -1,4 +1,6 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Use same origin — Next.js rewrites /api/* to the backend server-side
+// This avoids mixed-content blocking (HTTPS frontend → HTTP backend)
+const API_BASE = "";
 
 /**
  * Generate a simple device fingerprint from browser properties.
@@ -184,9 +186,24 @@ class ApiClient {
       session_id: string;
       tier: string;
       max_resolution: string;
+      rotation_interval: number;
     }>("/api/video/otp", {
       method: "POST",
       body: JSON.stringify({ video_id: videoId, client_tier: "browser" }),
+    });
+  }
+
+  async rotateOTP(sessionId: string, videoId: string) {
+    return this.request<{
+      otp: string;
+      playback_info: string;
+      session_id: string;
+      tier: string;
+      max_resolution: string;
+      rotation_interval: number;
+    }>("/api/video/otp/rotate", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, video_id: videoId }),
     });
   }
 
