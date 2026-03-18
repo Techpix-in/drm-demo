@@ -2,13 +2,16 @@
 
 ## Overview
 
-This is the FastAPI backend that serves as the security layer between the frontend and VdoCipher's DRM video hosting. It implements 7 layers of anti-piracy protection to prevent browser-based content downloading.
+FastAPI backend serving as the security layer between the frontend and VdoCipher's DRM video hosting. Implements multi-layered anti-piracy protection with PostgreSQL for persistent data and Redis for ephemeral/real-time data.
 
 ## How to Run
 
 ```bash
-cd backend
-python3 -m uvicorn main:app --reload --port 8000
+# Using Docker (recommended)
+docker compose up --build -d
+
+# Or using the start script (starts everything)
+./start.sh
 ```
 
 ## Architecture
@@ -22,193 +25,200 @@ Frontend (Next.js :3000)
     ├── Get Videos ─────────────→ /api/videos (requires auth)
     │
     ├── Request Playback ───────→ /api/video/otp (requires auth)
-    │   [rate limit] → [anomaly detection] → [concurrent check] → VdoCipher API
-    │   ← otp + playbackInfo + session_id
+    │   [rate limit] → [anomaly detection] → [concurrent check] → [tier check] → VdoCipher API
+    │   ← otp + playbackInfo + session_id + tier + max_resolution
     │
     ├── Heartbeat (every 30s) ──→ /api/playback/heartbeat
+    │   Sends: session_id + playback_events (seek_count, restart_count, play_seconds)
+    │   Validates: IP binding + behavioral analysis
+    │   ← status + risk_level
     │
     └── End Session ────────────→ DELETE /api/playback/session/{id}
+
+Backend (FastAPI :8000)
+    │
+    ├── PostgreSQL (69.62.82.132:5432) — Users, Videos, Audit Logs
+    └── Redis (69.62.82.132:6379) — Sessions, Rate Limits, Risk Scores, Behavioral Data
 ```
 
-## File-by-File Explanation
+## Folder Structure
 
-### `main.py` — Application Entry Point
+```
+backend/
+├── app/
+│   ├── main.py              # FastAPI app, lifecycle (startup/shutdown), router registration
+│   ├── config.py            # All settings from env vars
+│   ├── api/                 # Route handlers (thin — delegate to core/services)
+│   │   ├── auth.py          # Login, logout, refresh, me
+│   │   ├── videos.py        # Video catalog endpoints
+│   │   ├── playback.py      # OTP generation, heartbeat, session management
+│   │   └── health.py        # Health check
+│   ├── core/                # Business logic
+│   │   ├── auth.py          # Token signing/verification, user auth (queries Postgres)
+│   │   ├── middleware.py    # Rate limiting (Redis sliding window), IP/fingerprint extraction
+│   │   └── security.py     # Risk scoring, anomaly detection (Redis), audit logging (Postgres)
+│   ├── db/                  # Data layer
+│   │   ├── postgres.py      # SQLAlchemy async engine, table definitions (UserDB, VideoDB, AuditLogDB)
+│   │   ├── redis.py         # Redis async connection pool
+│   │   └── seed.py          # Seeds initial users + videos on first startup
+│   ├── models/
+│   │   └── schemas.py       # Pydantic request/response models
+│   └── services/            # External integrations + domain logic
+│       ├── sessions.py      # Playback session CRUD (Redis hashes + sorted sets)
+│       ├── vdocipher.py     # VdoCipher OTP generation with tier-based controls
+│       └── videos.py        # Video CRUD (Postgres queries)
+├── Dockerfile
+├── requirements.txt
+└── .env                     # Environment variables (not committed)
+```
 
-The FastAPI app that wires all modules together. Defines all API routes and a background task for session cleanup.
+## Data Storage
 
-**Routes:**
+| Data | Store | Why |
+|------|-------|-----|
+| Users (email, password_hash, role) | **PostgreSQL** | Persistent, queryable, relational |
+| Videos (id, title, description) | **PostgreSQL** | Persistent catalog |
+| Audit Logs (event, user, ip, details) | **PostgreSQL** | Persistent, queryable for investigations |
+| Playback Sessions | **Redis** (hash + set) | Fast, auto-expires via TTL (90s) |
+| Rate Limits | **Redis** (sorted set) | Sliding window, auto-cleanup |
+| Risk Scores | **Redis** (sorted set + hash) | Decays after 1 hour |
+| Token Revocations | **Redis** (key with TTL) | Expires with token lifetime |
+| Behavioral Data (seeks, restarts) | **Redis** (sorted set per session) | Ephemeral, tied to session lifetime |
+| Request History (IPs, fingerprints) | **Redis** (list) | Rolling window for anomaly detection |
+
+## API Routes
 
 | Method | Endpoint | Auth | What It Does |
 |--------|----------|------|-------------|
-| POST | `/api/auth/login` | No | Authenticates user, returns session + refresh tokens. Rate-limited to 5 attempts per 15min per IP. |
-| POST | `/api/auth/refresh` | No | Exchanges a valid refresh token for a new session token. Verifies device fingerprint matches. |
-| POST | `/api/auth/logout` | Yes | Revokes the session token and terminates all active playback sessions for the user. |
-| GET | `/api/auth/me` | Yes | Returns the currently authenticated user's info. |
-| GET | `/api/videos` | Yes | Returns the video catalog. |
-| GET | `/api/videos/{id}` | Yes | Returns a single video's metadata. |
-| POST | `/api/video/otp` | Yes | **Core endpoint.** Generates a DRM playback token. This is where all 7 security layers are applied (see below). |
-| POST | `/api/playback/heartbeat` | Yes | Keeps a playback session alive. Must be called every 30 seconds. |
-| DELETE | `/api/playback/session/{id}` | Yes | Ends a specific playback session, freeing up a concurrent stream slot. |
-| GET | `/api/playback/sessions` | Yes | Lists all active playback sessions for the user. |
-| GET | `/api/health` | No | Health check. |
+| POST | `/api/auth/login` | No | Authenticates against Postgres, returns tokens. Rate-limited: 5/15min per IP. |
+| POST | `/api/auth/refresh` | No | Exchanges refresh token for new session token. Verifies device fingerprint. |
+| POST | `/api/auth/logout` | Yes | Revokes token in Redis, ends all playback sessions. |
+| GET | `/api/auth/me` | Yes | Returns current user info. |
+| GET | `/api/videos` | Yes | Returns video catalog from Postgres. |
+| GET | `/api/videos/{id}` | Yes | Returns single video metadata. |
+| POST | `/api/video/otp` | Yes | **Core endpoint.** Tier-aware OTP generation with all security layers. |
+| POST | `/api/playback/heartbeat` | Yes | Validates IP binding, analyzes behavioral events, refreshes session TTL. |
+| DELETE | `/api/playback/session/{id}` | Yes | Ends a playback session. |
+| GET | `/api/playback/sessions` | Yes | Lists active sessions for user. |
+| GET | `/api/health` | No | Health check (v3.0.0). |
 
-**Background Task:** Every 30 seconds, `cleanup_expired_sessions()` runs to remove sessions that haven't received a heartbeat within 90 seconds.
+## Module Details
 
----
+### `app/core/auth.py` — Authentication & Tokens
 
-### `config.py` — Configuration
+- Tokens are JSON payloads signed with HMAC-SHA256: `{json_payload}|{signature}`
+- Session tokens: 1 hour TTL, Refresh tokens: 7 days TTL
+- Both embed `device_fingerprint` — rejected if used from a different device
+- Token revocation stored in Redis with TTL matching token lifetime
+- `authenticate_user()` queries Postgres, verifies bcrypt password hash
 
-Loads environment variables and defines anti-piracy constants.
+### `app/core/middleware.py` — Rate Limiting (Redis)
 
-| Setting | Default | What It Controls |
-|---------|---------|-----------------|
-| `VDOCIPHER_API_SECRET` | (required) | VdoCipher API key for OTP generation |
-| `SESSION_SECRET` | dev-secret | HMAC key for signing session/refresh tokens |
-| `MAX_CONCURRENT_STREAMS` | 2 | How many videos a user can watch simultaneously |
-| `SESSION_TOKEN_TTL` | 3600 (1h) | How long a session token is valid |
-| `REFRESH_TOKEN_TTL` | 604800 (7d) | How long a refresh token is valid |
-| `SESSION_EXPIRY` | 90s | How long a playback session survives without heartbeat |
-| `LOGIN_RATE_LIMIT` | 5/15min | Max login attempts per IP |
-| `OTP_RATE_LIMIT` | 10/1min | Max OTP requests per user |
-| `RISK_SCORE_THRESHOLD` | 100 | Risk score at which a user is temporarily blocked |
+- **Sliding window algorithm** using Redis sorted sets (not in-memory dicts)
+- Each rate limit key: `ratelimit:{type}:{identifier}` with scores as timestamps
+- Survives container restarts (Redis-backed)
+- Three limiters: login (5/15min per IP), OTP (10/min per user), license (20/min per user)
 
----
+### `app/core/security.py` — Anomaly Detection & Risk Scoring
 
-### `auth.py` — Authentication & Token Management
+**Risk Score System (Redis):**
+- Points stored in sorted set `risk:{user_id}` with hash `risk_points:{user_id}`
+- Points decay after 1 hour automatically (zremrangebyscore)
+- At 100 points → user blocked (HTTP 403)
 
-Handles user login, token creation, verification, and revocation.
+**`analyze_request()` — 3 checks on every OTP request:**
+1. **Impossible Travel** (+30 pts): IP changes within 5 minutes
+2. **Fingerprint Proliferation** (+25 pts): >5 unique devices
+3. **Rapid Fingerprint Switching** (+20 pts): Device changes within 60 seconds
 
-**How tokens work:**
-- Tokens are JSON payloads signed with HMAC-SHA256. Format: `{json_payload}|{signature}`
-- Session tokens expire in 1 hour, refresh tokens in 7 days
-- Both tokens embed a `device_fingerprint` — if a token is used from a different device, it's rejected
-- On logout, the token's signature is added to a revocation set so it can't be reused
+**Audit Logging:** Writes to both console (structured JSON) and Postgres `audit_logs` table.
 
-**Key functions:**
-- `create_session_token(user, fingerprint)` — Creates a 1-hour session token bound to the device
-- `create_refresh_token(user, fingerprint)` — Creates a 7-day refresh token bound to the device
-- `verify_session_token(token, fingerprint)` — Verifies signature, expiry, revocation, and device match
-- `verify_refresh_token(token, fingerprint)` — Same as above but for refresh tokens
-- `revoke_token(token)` — Adds token signature to blocklist
-- `get_current_user(request)` — FastAPI dependency that extracts and verifies the user from the Authorization header
+### `app/services/sessions.py` — Playback Sessions (Redis)
 
----
+**Redis keys per session:**
+- `session:{session_id}` — hash with session data (TTL: 90s, refreshed on heartbeat)
+- `user_sessions:{user_id}` — set of active session IDs
+- `seeks:{session_id}` — sorted set of seek event timestamps
+- `restarts:{session_id}` — sorted set of restart event timestamps
 
-### `middleware.py` — Rate Limiting & Device Fingerprinting
+**IP Binding:** Heartbeat validates IP hasn't changed. 3+ IP changes → session killed.
 
-**Rate Limiter (`InMemoryRateLimiter`):**
-- Sliding window algorithm using in-memory dict of timestamps
-- `check(key, limit, window)` — Returns True if the request is allowed
-- When a limit is hit, the API returns HTTP 429 with a `Retry-After` header
+**Behavioral Detection (on heartbeat):**
+1. **Excessive Seeking** (>15/min): Detects ripping tools that seek through video
+2. **Rapid Restarts** (>10/hr): Detects automation scripts
+3. **Continuous Play** (>8h): Nobody watches 8 hours straight
 
-**Device Fingerprint:**
-- `get_device_fingerprint(request)` — Reads the `X-Device-Fingerprint` header sent by the frontend
-- If the header is missing, it generates a fallback fingerprint from `SHA256(User-Agent + IP)` (truncated to 16 chars)
-- The fingerprint is used for: device binding in tokens, anomaly detection, watermarking
+**Page Refresh Handling:** Same user+video+device reuses existing session instead of creating new one.
 
-**Client IP:**
-- `get_client_ip(request)` — Reads `X-Forwarded-For` (for proxied setups) or falls back to `request.client.host`
+### `app/services/vdocipher.py` — VdoCipher Integration
 
----
+**Tier-based OTP generation:**
 
-### `security.py` — Anomaly Detection & Audit Logging
+| Tier | OTP TTL | Max Resolution | Watermark |
+|------|---------|---------------|-----------|
+| `browser` | 120s | 480p | Yes |
+| `mobile_app` | 300s | 1080p | Yes |
+| `smart_tv` | 300s | 4K | Yes |
 
-**Audit Logger:**
-- `audit_log(event_type, user_id, ip, details)` — Writes structured JSON log entries
-- Log levels: INFO for normal events, WARNING for anomalies, ERROR for blocks
-- Events tracked: `LOGIN_SUCCESS`, `LOGIN_FAILED`, `OTP_GENERATED`, `ANOMALY_DETECTED`, `USER_BLOCKED`, `LOGOUT`
+**Dynamic Forensic Watermark:**
+- 10% opacity (near-invisible to viewers)
+- Moves every 3 seconds (harder to crop out)
+- Contains: `userId|timestamp|deviceFingerprint`
+- Survives re-encoding and cropping
 
-**Risk Score System:**
-- Each user accumulates risk points from suspicious behavior
-- Points decay after 1 hour (so legitimate users recover)
-- At 100 points, the user is temporarily blocked (HTTP 403)
+**OTP parameters sent to VdoCipher:**
 
-**`analyze_request(user_id, ip, fingerprint)` — runs 3 checks on every OTP request:**
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `ttl` | 120s (browser) / 300s (mobile) | Prevents token sharing |
+| `annotate` | Dynamic watermark | Forensic tracing of leaks |
+| `userId` | user_id (max 36 chars) | VdoCipher viewer analytics |
+| `whitelisthref` | production domain | Blocks playback on pirate sites |
 
-1. **Impossible Travel** (+30 points): If the user's IP changes within 5 minutes. Catches VPN-hopping or token sharing between different networks.
+### `app/db/postgres.py` — Database Tables
 
-2. **Fingerprint Proliferation** (+25 points): If a user has used more than 5 different device fingerprints. Catches credential sharing across many devices.
+**`users`**: id, email, name, password_hash, role, is_active, created_at, updated_at
+**`videos`**: id (VdoCipher ID), title, description, thumbnail, duration, is_active, created_at
+**`audit_logs`**: id, event_type, user_id, ip_address, details (JSON), created_at
 
-3. **Rapid Fingerprint Switching** (+20 points): If the device fingerprint changes within 60 seconds of the last request. Catches automated tools that rotate browser profiles.
+### `app/db/seed.py` — Initial Data
 
----
+On first startup (tables empty), seeds:
+- 2 users: `viewer@example.com` / `demo123`, `admin@example.com` / `admin123`
+- 1 video: VdoCipher video ID `bd3ca7a235663ed1570e305f3775414a`
 
-### `sessions.py` — Concurrent Stream Limiting
-
-Tracks active playback sessions and enforces a per-user limit.
-
-**How it works:**
-1. When a user requests an OTP (`/api/video/otp`), a playback session is created
-2. The frontend sends a heartbeat every 30 seconds to keep the session alive
-3. If no heartbeat arrives within 90 seconds, the session is considered dead
-4. If the user tries to start a 3rd stream (with limit = 2), they get HTTP 403
-
-**Key functions:**
-- `create_playback_session(user_id, video_id, fingerprint, ip)` — Creates a session, returns session_id. Raises 403 if at limit.
-- `heartbeat(session_id)` — Updates the last_heartbeat timestamp
-- `end_session(session_id)` — Explicitly ends a session (called on page unmount or logout)
-- `cleanup_expired_sessions()` — Background cleanup of dead sessions
-
----
-
-### `vdocipher.py` — VdoCipher DRM Integration
-
-Calls VdoCipher's OTP API with all security parameters.
-
-**`generate_otp(video_id, user, ip_address, device_fingerprint)` sends:**
-
-| Parameter | Value | What It Does |
-|-----------|-------|-------------|
-| `ttl` | 300 (5min) | OTP expires in 5 minutes — prevents token sharing |
-| `annotate` | `[{type:"rtext", text:"email\|user_id\|fingerprint"}]` | Forensic watermark burned into the video stream with the viewer's identity |
-| `ipGeo` | `{"allow": ["viewer_ip"]}` | Locks the OTP to the viewer's current IP address |
-| `licenseRules` | `{"canPersist": false}` | **Most impactful parameter.** Tells the DRM CDM to reject any attempt to save decryption keys for offline use. Blocks most ripping tools. |
-| `userId` | user_id (max 36 chars) | Enables VdoCipher's viewer analytics dashboard |
-| `whitelisthref` | production domain | Locks playback to your domain only (prevents iframe embedding on pirate sites) |
-
----
-
-### `models.py` — Pydantic Data Models
-
-Defines all request/response schemas used by the API. Key models:
-- `LoginResponse` — includes both `token` and `refresh_token`
-- `OTPResponse` — includes `session_id` for heartbeat tracking
-- `PlaybackSession` — tracks session_id, user, video, device, IP, timestamps
-- `ActiveSessionsResponse` — lists sessions with `max_allowed` count
-
----
-
-### `videos.py` — Video Catalog
-
-Hardcoded list of VdoCipher video IDs with metadata. In production, replace with a database.
-
----
-
-## 7 Security Layers (applied on every OTP request)
+## Security Layers (applied on every OTP request)
 
 ```
 Request arrives at POST /api/video/otp
     │
-    ├── Layer 1: Authentication (Bearer token with device binding)
-    ├── Layer 2: Rate Limiting (10 req/min per user)
-    ├── Layer 3: Anomaly Detection (impossible travel, fingerprint abuse)
-    ├── Layer 4: Concurrent Stream Limit (max 2 active sessions)
-    ├── Layer 5: IP-Bound OTP (VdoCipher ipGeo locks to viewer's IP)
-    ├── Layer 6: canPersist: false (blocks offline ripping tools)
-    └── Layer 7: Forensic Watermark (viewer identity burned into stream)
+    ├── Layer 1: Authentication (Bearer token + device binding)
+    ├── Layer 2: Rate Limiting (10 req/min per user — Redis)
+    ├── Layer 3: Anomaly Detection (impossible travel, fingerprint abuse — Redis)
+    ├── Layer 4: Concurrent Stream Limit (max 2 active sessions — Redis)
+    ├── Layer 5: Tier-Based Controls (browser=480p/120s, mobile=1080p/300s)
+    ├── Layer 6: Dynamic Forensic Watermark (10% opacity, moves every 3s)
+    └── Layer 7: Behavioral Monitoring (seeks, restarts, continuous play — Redis)
     │
-    ← Returns: otp + playbackInfo + session_id
+    ← Returns: otp + playbackInfo + session_id + tier + max_resolution
 ```
 
 ## Environment Variables
 
-Create a `.env` file in the backend directory:
-
 ```
+# VdoCipher
 VDOCIPHER_API_SECRET=your_api_secret_here
+
+# Auth
 SESSION_SECRET=a-long-random-string-for-production
-FRONTEND_URL=http://localhost:3000
+
+# CORS
+FRONTEND_URL=http://localhost:3000,https://drm-demo.vercel.app
+
+# VdoCipher domain lock (leave empty for dev)
 ALLOWED_DOMAIN=
-MAX_CONCURRENT_STREAMS=2
-SESSION_TOKEN_TTL=3600
+
+# Database
+DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/securestream
+REDIS_URL=redis://:password@host:6379/0
 ```

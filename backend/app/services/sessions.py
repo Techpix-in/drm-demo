@@ -155,6 +155,30 @@ async def _analyze_playback_behavior(
     return flags
 
 
+async def validate_session_for_rotation(
+    session_id: str, video_id: str, user_id: str
+) -> dict:
+    """
+    Validate that a session exists, belongs to the user,
+    and matches the video. Used before issuing a rotated OTP.
+    """
+    session = await _get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    if session.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+
+    if session.get("video_id") != video_id:
+        raise HTTPException(status_code=400, detail="Video ID does not match session")
+
+    # Track rotation count
+    r = get_redis()
+    count = await r.hincrby(f"session:{session_id}", "otp_rotations", 1)
+
+    return {**session, "otp_rotations": count}
+
+
 async def end_session(session_id: str) -> None:
     r = get_redis()
     session = await _get_session(session_id)

@@ -14,13 +14,15 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
   const [loading, setLoading] = useState(true);
   const [tier, setTier] = useState<string>("browser");
   const [maxRes, setMaxRes] = useState<string>("480p");
+  const [rotationCount, setRotationCount] = useState(0);
   const sessionIdRef = useRef<string | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rotationRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rotationIntervalRef = useRef(90); // seconds, updated from server
 
   // Behavioral tracking refs
   const seekCountRef = useRef(0);
   const restartCountRef = useRef(0);
-  const playSecondsRef = useRef(0);
   const lastHeartbeatTimeRef = useRef(Date.now());
 
   // Track seeks via iframe message events
@@ -50,9 +52,10 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
         setTier(data.tier || "browser");
         setMaxRes(data.max_resolution || "480p");
         sessionIdRef.current = data.session_id;
+        rotationIntervalRef.current = data.rotation_interval || 90;
         lastHeartbeatTimeRef.current = Date.now();
 
-        // Start heartbeat every 30 seconds with behavioral events
+        // Start heartbeat every 30 seconds
         heartbeatRef.current = setInterval(async () => {
           if (!sessionIdRef.current) return;
 
@@ -66,7 +69,6 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
             play_seconds: Math.round(elapsed),
           };
 
-          // Reset counters after sending
           seekCountRef.current = 0;
           restartCountRef.current = 0;
 
@@ -80,11 +82,15 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
                 "Playback suspended due to unusual activity. Please try again later."
               );
               if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+              if (rotationRef.current) clearInterval(rotationRef.current);
             }
           } catch {
             if (heartbeatRef.current) clearInterval(heartbeatRef.current);
           }
         }, 30000);
+
+        // Start OTP rotation
+        startOTPRotation();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load video");
       } finally {
@@ -92,10 +98,35 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
       }
     }
 
+    function startOTPRotation() {
+      // Clear any existing rotation timer
+      if (rotationRef.current) clearInterval(rotationRef.current);
+
+      rotationRef.current = setInterval(async () => {
+        if (!sessionIdRef.current) return;
+
+        try {
+          const data = await api.rotateOTP(sessionIdRef.current, videoId);
+          setOtp(data.otp);
+          setPlaybackInfo(data.playback_info);
+          setRotationCount((c) => c + 1);
+
+          // Update interval if server changed it
+          if (data.rotation_interval) {
+            rotationIntervalRef.current = data.rotation_interval;
+          }
+        } catch (err) {
+          // If rotation fails, player continues with current OTP until it expires
+          console.warn("OTP rotation failed:", err);
+        }
+      }, rotationIntervalRef.current * 1000);
+    }
+
     fetchOTP();
 
     return () => {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      if (rotationRef.current) clearInterval(rotationRef.current);
       if (sessionIdRef.current) {
         api.endSession(sessionIdRef.current).catch(() => {});
       }
@@ -132,9 +163,16 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
         allow="encrypted-media"
         allowFullScreen
       />
-      {/* Tier badge — shows resolution cap */}
-      <div className="absolute top-3 right-3 bg-black/60 text-xs text-gray-300 px-2 py-1 rounded">
-        {tier === "browser" ? `Browser · Max ${maxRes}` : `${tier} · ${maxRes}`}
+      {/* Tier badge + rotation indicator */}
+      <div className="absolute top-3 right-3 flex items-center gap-2">
+        {rotationCount > 0 && (
+          <div className="bg-green-900/60 text-xs text-green-300 px-2 py-1 rounded">
+            OTP #{rotationCount + 1}
+          </div>
+        )}
+        <div className="bg-black/60 text-xs text-gray-300 px-2 py-1 rounded">
+          {tier === "browser" ? `Browser · Max ${maxRes}` : `${tier} · ${maxRes}`}
+        </div>
       </div>
     </div>
   );

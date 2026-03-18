@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.config import MAX_CONCURRENT_STREAMS, BEHAVIORAL_RISK_POINTS
+from app.config import (
+    MAX_CONCURRENT_STREAMS,
+    BEHAVIORAL_RISK_POINTS,
+    OTP_ROTATION_INTERVAL_BROWSER,
+    OTP_ROTATION_INTERVAL_MOBILE,
+)
 from app.models.schemas import (
     OTPRequest,
     OTPResponse,
+    OTPRotateRequest,
     HeartbeatRequest,
     HeartbeatResponse,
     ActiveSessionsResponse,
@@ -17,6 +23,7 @@ from app.services.sessions import (
     heartbeat as session_heartbeat,
     end_session,
     get_user_sessions,
+    validate_session_for_rotation,
 )
 from app.services.videos import get_video_by_id
 from app.services.vdocipher import generate_otp
@@ -57,15 +64,73 @@ async def get_otp(
                 "max_resolution": otp_data["max_resolution"],
             },
         )
+        rotation_interval = (
+            OTP_ROTATION_INTERVAL_BROWSER
+            if client_tier == "browser"
+            else OTP_ROTATION_INTERVAL_MOBILE
+        )
         return OTPResponse(
             otp=otp_data["otp"],
             playback_info=otp_data["playback_info"],
             session_id=session_id,
             tier=otp_data["tier"],
             max_resolution=otp_data["max_resolution"],
+            rotation_interval=rotation_interval,
         )
     except Exception as e:
         await end_session(session_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/video/otp/rotate", response_model=OTPResponse)
+async def rotate_otp(
+    body: OTPRotateRequest,
+    request: Request,
+    user: SessionUser = Depends(get_current_user),
+):
+    """
+    Issue a fresh OTP for an active session.
+    Validates: session exists, belongs to user, matches video.
+    Rate-limited same as regular OTP requests.
+    """
+    ip = get_client_ip(request)
+    fingerprint = get_device_fingerprint(request)
+
+    await check_otp_rate_limit(request, user)
+
+    # Validate session ownership and video match
+    session = await validate_session_for_rotation(
+        body.session_id, body.video_id, user.user_id
+    )
+
+    client_tier = session.get("client_tier", "browser")
+
+    try:
+        otp_data = await generate_otp(body.video_id, user, ip, fingerprint, client_tier)
+        await audit_log(
+            "OTP_ROTATED",
+            user_id=user.user_id,
+            ip=ip,
+            details={
+                "video_id": body.video_id,
+                "session_id": body.session_id,
+                "rotation_count": session.get("otp_rotations", 0),
+            },
+        )
+        rotation_interval = (
+            OTP_ROTATION_INTERVAL_BROWSER
+            if client_tier == "browser"
+            else OTP_ROTATION_INTERVAL_MOBILE
+        )
+        return OTPResponse(
+            otp=otp_data["otp"],
+            playback_info=otp_data["playback_info"],
+            session_id=body.session_id,
+            tier=otp_data["tier"],
+            max_resolution=otp_data["max_resolution"],
+            rotation_interval=rotation_interval,
+        )
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

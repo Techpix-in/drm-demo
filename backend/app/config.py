@@ -30,6 +30,10 @@ SESSION_EXPIRY = 90
 OTP_TTL_BROWSER = int(os.getenv("OTP_TTL_BROWSER", "120"))
 OTP_TTL_MOBILE = int(os.getenv("OTP_TTL_MOBILE", "300"))
 
+# OTP rotation — frontend requests a fresh OTP before the current one expires
+OTP_ROTATION_INTERVAL_BROWSER = 90   # rotate every 90s (before 120s expiry)
+OTP_ROTATION_INTERVAL_MOBILE = 240   # rotate every 240s (before 300s expiry)
+
 # Rate limiting
 LOGIN_RATE_LIMIT = 5
 LOGIN_RATE_WINDOW = 900

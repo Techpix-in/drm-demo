@@ -21,6 +21,12 @@ class OTPResponse(BaseModel):
     session_id: str
     tier: str
     max_resolution: str
+    rotation_interval: int = 90
+
+
+class OTPRotateRequest(BaseModel):
+    session_id: str
+    video_id: str
 
 
 class LoginRequest(BaseModel):
