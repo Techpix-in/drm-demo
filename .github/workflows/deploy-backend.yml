@@ -23,5 +23,5 @@ jobs:
             set -e
             cd ${{ secrets.VPS_PROJECT_PATH }}
             git pull origin main
-            docker compose up --build -d backend
+            docker compose -f docker-compose.prod.yml up --build -d backend
             docker image prune -f

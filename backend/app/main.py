@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+# Comment
 from app.config import FRONTEND_URLS
 from app.db.postgres import init_db
 from app.db.redis import init_redis, close_redis
