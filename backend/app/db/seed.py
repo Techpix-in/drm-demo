@@ -1,7 +1,7 @@
 from passlib.hash import bcrypt
 from sqlalchemy import select
 
-from app.db.postgres import async_session, UserDB, VideoDB
+from app.db.postgres import async_session, UserDB
 
 
 SEED_USERS = [
@@ -18,16 +18,6 @@ SEED_USERS = [
         "name": "Admin User",
         "password": "admin123",
         "role": "admin",
-    },
-]
-
-SEED_VIDEOS = [
-    {
-        "id": "bd3ca7a235663ed1570e305f3775414a",
-        "title": "Premium Content - Episode 1",
-        "description": "DRM-protected premium content with forensic watermarking enabled.",
-        "thumbnail": "/thumbnails/video1.jpg",
-        "duration": "24:30",
     },
 ]
 
@@ -50,12 +40,10 @@ async def seed_database():
         else:
             print("Users already exist, skipping seed")
 
-        existing = await session.execute(select(VideoDB).limit(1))
-        if not existing.scalar_one_or_none():
-            for v in SEED_VIDEOS:
-                video = VideoDB(**v)
-                session.add(video)
-            await session.commit()
-            print(f"Seeded {len(SEED_VIDEOS)} videos")
-        else:
-            print("Videos already exist, skipping seed")
+    # Sync videos from VdoCipher
+    try:
+        from app.services.videos import sync_videos_from_vdocipher
+        result = await sync_videos_from_vdocipher()
+        print(f"Synced videos from VdoCipher: {result['added']} added, {result['updated']} updated, {result['total_from_vdocipher']} total")
+    except Exception as e:
+        print(f"VdoCipher video sync failed (will use existing videos): {e}")

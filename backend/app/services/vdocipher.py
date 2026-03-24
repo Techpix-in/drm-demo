@@ -31,6 +31,65 @@ def _build_dynamic_watermark(user: SessionUser, device_fingerprint: str) -> dict
     }
 
 
+async def fetch_all_videos_from_vdocipher() -> list[dict]:
+    """Fetch all videos from VdoCipher account via their API."""
+    if not VDOCIPHER_API_SECRET:
+        raise ValueError("VDOCIPHER_API_SECRET is not configured")
+
+    all_videos = []
+    page = 1
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            response = await client.get(
+                f"{VDOCIPHER_API_BASE}/videos",
+                headers={
+                    "Authorization": f"Apisecret {VDOCIPHER_API_SECRET}",
+                    "Accept": "application/json",
+                },
+                params={"page": page, "limit": 20},
+            )
+
+            if response.status_code != 200:
+                raise Exception(
+                    f"VdoCipher video list failed: {response.status_code} - {response.text}"
+                )
+
+            data = response.json()
+            rows = data.get("rows", data) if isinstance(data, dict) else data
+
+            if not rows:
+                break
+
+            for v in rows:
+                # VdoCipher returns: id, title, description, length (seconds), status, poster
+                vid_id = v.get("id", "")
+                status = v.get("status", "")
+                if not vid_id or status not in ("ready", "Ready"):
+                    continue
+
+                length_sec = v.get("length", 0) or 0
+                mins = int(length_sec) // 60
+                secs = int(length_sec) % 60
+                duration = f"{mins}:{secs:02d}" if length_sec else ""
+
+                all_videos.append({
+                    "id": vid_id,
+                    "title": v.get("title", "Untitled"),
+                    "description": v.get("description", ""),
+                    "thumbnail": v.get("poster", ""),
+                    "duration": duration,
+                })
+
+            # Check if there are more pages
+            count = data.get("count", 0) if isinstance(data, dict) else 0
+            if len(all_videos) >= count or not rows:
+                break
+            page += 1
+
+    return all_videos
+
+
 async def generate_otp(
     video_id: str,
     user: SessionUser,

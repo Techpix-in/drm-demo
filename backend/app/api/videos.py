@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.models.schemas import SessionUser
 from app.core.auth import get_current_user
-from app.services.videos import get_all_videos, get_video_by_id
+from app.services.videos import get_all_videos, get_video_by_id, sync_videos_from_vdocipher
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
@@ -19,3 +19,10 @@ async def get_video(video_id: str, user: SessionUser = Depends(get_current_user)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     return video.model_dump()
+
+
+@router.post("/sync")
+async def sync_videos(user: SessionUser = Depends(get_current_user)):
+    """Fetch all videos from VdoCipher and sync into local database."""
+    result = await sync_videos_from_vdocipher()
+    return result

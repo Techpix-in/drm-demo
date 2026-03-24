@@ -1,9 +1,9 @@
 from typing import Optional
 
 from sqlalchemy import select
-# Comment
 from app.db.postgres import async_session, VideoDB
 from app.models.schemas import Video
+from app.services.vdocipher import fetch_all_videos_from_vdocipher
 
 
 async def get_all_videos() -> list[Video]:
@@ -38,3 +38,44 @@ async def get_video_by_id(video_id: str) -> Optional[Video]:
             thumbnail=row.thumbnail or "",
             duration=row.duration or "",
         )
+
+
+async def sync_videos_from_vdocipher() -> dict:
+    """Fetch all videos from VdoCipher and upsert into Postgres."""
+    vdocipher_videos = await fetch_all_videos_from_vdocipher()
+
+    added = 0
+    updated = 0
+
+    async with async_session() as session:
+        for v in vdocipher_videos:
+            result = await session.execute(
+                select(VideoDB).where(VideoDB.id == v["id"])
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                existing.title = v["title"]
+                existing.description = v["description"]
+                existing.thumbnail = v["thumbnail"]
+                existing.duration = v["duration"]
+                existing.is_active = True
+                updated += 1
+            else:
+                session.add(VideoDB(
+                    id=v["id"],
+                    title=v["title"],
+                    description=v["description"],
+                    thumbnail=v["thumbnail"],
+                    duration=v["duration"],
+                    is_active=True,
+                ))
+                added += 1
+
+        await session.commit()
+
+    return {
+        "total_from_vdocipher": len(vdocipher_videos),
+        "added": added,
+        "updated": updated,
+    }
