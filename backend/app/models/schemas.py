@@ -64,6 +64,7 @@ class HeartbeatResponse(BaseModel):
     expires_in: int
     risk_level: str = "normal"
     debug: dict = {}
+    flags: list = []
 
 
 class DebugInfoResponse(BaseModel):

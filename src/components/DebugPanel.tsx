@@ -24,17 +24,20 @@ export interface DebugData {
   totalPlaySeconds: number;
   ipChanges: number;
   currentIp: string;
-  seeksLastMinute: number;
-  restartsLastHour: number;
 
   // OTP
   otpRotations: number;
   rotationInterval: number;
   lastRotation: number | null;
 
-  // Behavioral (current interval)
-  seeksSinceHeartbeat: number;
-  restartsSinceHeartbeat: number;
+  // Server-side signals
+  heartbeatCount: number;
+  missedHeartbeats: number;
+  sessionAgeSeconds: number;
+  playRatio: number;
+  recentSessionCreations: number;
+  ghostSessions: number;
+  flags: string[];
 
   // Rate limits (from debug endpoint)
   rateLimits: {
@@ -53,7 +56,7 @@ interface DebugPanelProps {
   events: DebugEvent[];
 }
 
-type TabId = "session" | "heartbeat" | "otp" | "behavior" | "rates" | "log";
+type TabId = "session" | "heartbeat" | "otp" | "signals" | "rates" | "log";
 
 function formatTime(ts: number | null): string {
   if (!ts) return "--";
@@ -214,7 +217,7 @@ export default function DebugPanel({ data, events }: DebugPanelProps) {
     { id: "session", label: "Session", icon: "S" },
     { id: "heartbeat", label: "Heartbeat", icon: "H" },
     { id: "otp", label: "OTP", icon: "O" },
-    { id: "behavior", label: "Behavior", icon: "B" },
+    { id: "signals", label: "Signals", icon: "!" },
     { id: "rates", label: "Limits", icon: "R" },
     { id: "log", label: "Log", icon: "L" },
   ];
@@ -297,17 +300,16 @@ export default function DebugPanel({ data, events }: DebugPanelProps) {
               <div className="space-y-3">
                 <div className="space-y-1">
                   <KV label="Status" value={data.heartbeatStatus || "--"} />
-                  <KV
-                    label="Risk Level"
-                    value={data.riskLevel || "normal"}
-                  />
+                  <KV label="Risk Level" value={data.riskLevel || "normal"} />
+                  <KV label="Heartbeat #" value={data.heartbeatCount} />
+                  <KV label="Missed Heartbeats" value={`${data.missedHeartbeats}/${3}`} />
                   <KV label="Last Heartbeat" value={formatTime(data.lastHeartbeat)} mono />
                 </div>
                 <HeartbeatCountdown lastHeartbeat={data.lastHeartbeat} />
                 <div className="mt-2 p-2.5 bg-gray-900 rounded text-xs">
-                  <p className="text-gray-500 mb-1">Last payload sent:</p>
+                  <p className="text-gray-500 mb-1">Server-side metrics:</p>
                   <p className="text-gray-300 font-mono">
-                    seeks: {data.seeksLastMinute} | restarts: {data.restartsLastHour} | play: {formatDuration(data.totalPlaySeconds)}
+                    play_ratio: {data.playRatio?.toFixed(2) || "--"} | sessions: {data.recentSessionCreations} | ghosts: {data.ghostSessions}
                   </p>
                 </div>
               </div>
@@ -325,30 +327,60 @@ export default function DebugPanel({ data, events }: DebugPanelProps) {
               </div>
             )}
 
-            {activeTab === "behavior" && (
+            {activeTab === "signals" && (
               <div className="space-y-3">
-                <div className="space-y-1">
-                  <KV label="Seeks (this interval)" value={data.seeksSinceHeartbeat} />
-                  <KV label="Restarts (this interval)" value={data.restartsSinceHeartbeat} />
-                </div>
+                <p className="text-xs text-gray-500 mb-2">
+                  Server-side signals — these cannot be faked by the client
+                </p>
+
                 <ProgressBar
-                  value={data.seeksLastMinute}
-                  max={30}
-                  label={`Seeks/min: ${data.seeksLastMinute}/30`}
-                  color={data.seeksLastMinute > 20 ? "bg-red-500" : data.seeksLastMinute > 10 ? "bg-yellow-500" : "bg-green-500"}
-                />
-                <ProgressBar
-                  value={data.restartsLastHour}
-                  max={15}
-                  label={`Restarts/hr: ${data.restartsLastHour}/15`}
-                  color={data.restartsLastHour > 10 ? "bg-red-500" : data.restartsLastHour > 5 ? "bg-yellow-500" : "bg-green-500"}
+                  value={data.playRatio || 1}
+                  max={1}
+                  label={`Play ratio: ${(data.playRatio || 1).toFixed(2)} (min: 0.30)`}
+                  color={(data.playRatio || 1) < 0.3 ? "bg-red-500" : (data.playRatio || 1) < 0.5 ? "bg-yellow-500" : "bg-green-500"}
                 />
                 <ProgressBar
                   value={data.totalPlaySeconds / 3600}
                   max={10}
-                  label={`Continuous play: ${formatDuration(data.totalPlaySeconds)}/10h`}
+                  label={`Continuous play: ${formatDuration(data.totalPlaySeconds)} / 10h`}
                   color={data.totalPlaySeconds / 3600 > 8 ? "bg-red-500" : "bg-green-500"}
                 />
+                <ProgressBar
+                  value={data.recentSessionCreations}
+                  max={5}
+                  label={`Session creations (10min): ${data.recentSessionCreations}/5`}
+                  color={data.recentSessionCreations > 4 ? "bg-red-500" : data.recentSessionCreations > 3 ? "bg-yellow-500" : "bg-green-500"}
+                />
+                <ProgressBar
+                  value={data.ghostSessions}
+                  max={3}
+                  label={`Ghost sessions: ${data.ghostSessions}/3`}
+                  color={data.ghostSessions >= 3 ? "bg-red-500" : data.ghostSessions > 0 ? "bg-yellow-500" : "bg-green-500"}
+                />
+                <ProgressBar
+                  value={data.missedHeartbeats}
+                  max={3}
+                  label={`Missed heartbeats: ${data.missedHeartbeats}/3`}
+                  color={data.missedHeartbeats >= 3 ? "bg-red-500" : data.missedHeartbeats > 0 ? "bg-yellow-500" : "bg-green-500"}
+                />
+
+                {/* Active flags */}
+                <div className="mt-2">
+                  <p className="text-xs text-gray-500 mb-1">Active flags:</p>
+                  {data.flags.length === 0 ? (
+                    <p className="text-xs text-green-400 font-mono">None — all clear</p>
+                  ) : (
+                    <div className="space-y-1">
+                      {data.flags.map((flag, i) => (
+                        <div key={i} className="text-xs font-mono text-red-400 bg-red-900/20 px-2 py-1 rounded">
+                          {flag}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Risk score */}
                 <div className="mt-2">
                   <div className="flex justify-between text-xs mb-1">
                     <span className="text-gray-500">Risk Score</span>

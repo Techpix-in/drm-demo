@@ -156,10 +156,25 @@ async def playback_heartbeat(
         playback_events=body.playback_events or {},
     )
 
-    if result.get("risk_level") == "blocked":
-        await add_risk_points(user.user_id, BEHAVIORAL_RISK_POINTS, "behavioral_blocked", ip=ip)
+    flags = result.get("debug", {}).get("flags", [])
 
-    return HeartbeatResponse(**result)
+    if result.get("risk_level") == "blocked":
+        await add_risk_points(
+            user.user_id, BEHAVIORAL_RISK_POINTS,
+            f"server_signals:{','.join(flags)}", ip=ip,
+        )
+        await audit_log(
+            "ANOMALY_DETECTED", user_id=user.user_id, ip=ip,
+            details={"flags": flags, "session_id": body.session_id},
+        )
+
+    return HeartbeatResponse(
+        status=result["status"],
+        expires_in=result["expires_in"],
+        risk_level=result["risk_level"],
+        debug=result.get("debug", {}),
+        flags=flags,
+    )
 
 
 @router.delete("/playback/session/{session_id}")

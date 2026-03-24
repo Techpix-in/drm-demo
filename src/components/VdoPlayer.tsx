@@ -59,9 +59,12 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
     createdAt: null, lastHeartbeat: null, heartbeatStatus: "",
     riskLevel: "normal", sessionTtl: 90, totalPlaySeconds: 0,
     ipChanges: 0, currentIp: "", seeksLastMinute: 0,
-    restartsLastHour: 0, otpRotations: 0, rotationInterval: 90,
-    lastRotation: null, seeksSinceHeartbeat: 0,
-    restartsSinceHeartbeat: 0, rateLimits: null,
+    otpRotations: 0, rotationInterval: 90,
+    lastRotation: null,
+    heartbeatCount: 0, missedHeartbeats: 0, sessionAgeSeconds: 0,
+    playRatio: 1, recentSessionCreations: 0, ghostSessions: 0,
+    flags: [],
+    rateLimits: null,
     riskScore: 0, riskThreshold: 100, riskStatus: "normal",
   });
   const debugEventsRef = useRef<DebugEvent[]>([]);
@@ -73,8 +76,6 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
 
   const pushDebug = useCallback(() => {
     if (!debugRef.current || !onDebugUpdateRef.current) return;
-    debugDataRef.current.seeksSinceHeartbeat = seekCountRef.current;
-    debugDataRef.current.restartsSinceHeartbeat = restartCountRef.current;
     onDebugUpdateRef.current({ ...debugDataRef.current }, [...debugEventsRef.current]);
   }, []);
 
@@ -168,23 +169,29 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
           try {
             const result = await api.sendHeartbeat(sessionIdRef.current, events);
 
-            // Update debug
+            // Update debug from server-side signals
             debugDataRef.current.lastHeartbeat = Date.now();
             debugDataRef.current.heartbeatStatus = result.status;
             debugDataRef.current.riskLevel = result.risk_level;
+            debugDataRef.current.flags = result.flags || [];
             if (result.debug) {
               debugDataRef.current.sessionTtl = result.debug.session_ttl;
               debugDataRef.current.totalPlaySeconds = result.debug.total_play_seconds;
               debugDataRef.current.ipChanges = result.debug.ip_changes;
               debugDataRef.current.currentIp = result.debug.current_ip;
-              debugDataRef.current.seeksLastMinute = result.debug.seeks_last_minute;
-              debugDataRef.current.restartsLastHour = result.debug.restarts_last_hour;
               debugDataRef.current.otpRotations = result.debug.otp_rotations;
+              debugDataRef.current.heartbeatCount = result.debug.heartbeat_count;
+              debugDataRef.current.missedHeartbeats = result.debug.missed_heartbeats;
+              debugDataRef.current.sessionAgeSeconds = result.debug.session_age_seconds;
+              debugDataRef.current.playRatio = result.debug.play_ratio;
+              debugDataRef.current.recentSessionCreations = result.debug.recent_session_creations;
+              debugDataRef.current.ghostSessions = result.debug.ghost_sessions;
             }
 
+            const flagStr = result.flags?.length ? ` [${result.flags.join(", ")}]` : "";
             addEvent(
               result.risk_level === "normal" ? "HEARTBEAT" : "WARNING",
-              `${result.risk_level} (seeks:${seekSnapshot}, restarts:${restartSnapshot}, play:${Math.round(elapsed)}s)`
+              `${result.risk_level} (play:${Math.round(elapsed)}s, ratio:${result.debug?.play_ratio?.toFixed(2) || "--"})${flagStr}`
             );
 
             if (result.risk_level === "blocked") {

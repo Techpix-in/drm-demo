@@ -49,8 +49,15 @@ RISK_SCORE_THRESHOLD = 100
 RISK_SCORE_DECAY_SECONDS = 3600
 
 # Behavioral detection — thresholds tuned to avoid false positives
-# Normal viewers rarely hit these; only automated tools do
 MAX_SEEKS_PER_MINUTE = 30
 MAX_RESTARTS_PER_HOUR = 15
 MAX_CONTINUOUS_PLAY_HOURS = 10
 BEHAVIORAL_RISK_POINTS = 25
+
+# Server-side signal detection — these don't rely on frontend reporting
+MAX_OTP_ROTATIONS_PER_SESSION = 50     # Normal 2hr movie = ~80 rotations, but 50 in quick succession = suspicious
+GHOST_SESSION_THRESHOLD = 3            # Sessions created with 0 heartbeats
+RAPID_SESSION_CREATION_LIMIT = 5       # Max new sessions in 10 minutes
+RAPID_SESSION_CREATION_WINDOW = 600    # 10 minutes
+HEARTBEAT_GAP_TOLERANCE = 3            # Max missed heartbeats (90s gap) before flagging
+MIN_PLAY_RATIO = 0.3                   # play_seconds / elapsed_seconds — below 30% = suspicious

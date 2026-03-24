@@ -1,4 +1,3 @@
-import json
 import secrets
 import time
 
@@ -7,9 +6,13 @@ from fastapi import HTTPException
 from app.config import (
     MAX_CONCURRENT_STREAMS,
     SESSION_EXPIRY,
-    MAX_SEEKS_PER_MINUTE,
-    MAX_RESTARTS_PER_HOUR,
     MAX_CONTINUOUS_PLAY_HOURS,
+    RAPID_SESSION_CREATION_LIMIT,
+    RAPID_SESSION_CREATION_WINDOW,
+    GHOST_SESSION_THRESHOLD,
+    MIN_PLAY_RATIO,
+    HEARTBEAT_GAP_TOLERANCE,
+    BEHAVIORAL_RISK_POINTS,
 )
 from app.db.redis import get_redis
 
@@ -36,6 +39,7 @@ async def create_playback_session(
     await _evict_expired_for_user(user_id)
     user_key = f"user_sessions:{user_id}"
 
+    # Reuse existing session for same video + device
     members = await r.smembers(user_key)
     for sid in members:
         session = await _get_session(sid)
@@ -54,8 +58,15 @@ async def create_playback_session(
             "Stop another stream first.",
         )
 
+    # Track session creation rate (server-side signal #1)
+    creation_key = f"session_creations:{user_id}"
+    now = time.time()
+    await r.zadd(creation_key, {f"{now}": now})
+    await r.zremrangebyscore(creation_key, 0, now - RAPID_SESSION_CREATION_WINDOW)
+    await r.expire(creation_key, RAPID_SESSION_CREATION_WINDOW + 60)
+
     session_id = secrets.token_urlsafe(16)
-    now = str(time.time())
+    now_str = str(now)
 
     pipe = r.pipeline()
     pipe.hset(f"session:{session_id}", mapping={
@@ -64,14 +75,21 @@ async def create_playback_session(
         "video_id": video_id,
         "device_fingerprint": device_fingerprint,
         "ip_address": ip_address,
-        "created_at": now,
-        "last_heartbeat": now,
+        "created_at": now_str,
+        "last_heartbeat": now_str,
         "total_play_seconds": "0",
         "ip_changes": "0",
+        "heartbeat_count": "0",
+        "missed_heartbeats": "0",
     })
     pipe.expire(f"session:{session_id}", SESSION_EXPIRY)
     pipe.sadd(user_key, session_id)
     await pipe.execute()
+
+    # Track ghost sessions (sessions that never get a heartbeat)
+    # We record session creation; heartbeat clears it
+    await r.zadd(f"ghost_check:{user_id}", {session_id: now})
+    await r.expire(f"ghost_check:{user_id}", SESSION_EXPIRY * 2)
 
     return session_id
 
@@ -85,8 +103,11 @@ async def heartbeat(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    risk_level = "normal"
+    user_id = session.get("user_id", "")
+    now = time.time()
+    flags = []
 
+    # ── Server-side signal #1: IP change detection ──
     if ip_address and session.get("ip_address") != ip_address:
         ip_changes = int(session.get("ip_changes", 0)) + 1
         await r.hset(f"session:{session_id}", "ip_address", ip_address)
@@ -97,93 +118,97 @@ async def heartbeat(
                 status_code=403,
                 detail="Session terminated: too many IP changes detected.",
             )
-        risk_level = "warning"
+        flags.append(f"ip_change:{ip_changes}/3")
 
-    if playback_events:
-        flags = await _analyze_playback_behavior(session_id, session, playback_events)
-        if flags:
-            risk_level = "warning" if len(flags) < 3 else "blocked"
+    # ── Server-side signal #2: Heartbeat gap detection ──
+    last_hb = float(session.get("last_heartbeat", now))
+    gap = now - last_hb
+    expected_interval = 30  # heartbeat every 30s
+    if gap > expected_interval * 2.5:  # missed at least 1 heartbeat
+        missed = int(session.get("missed_heartbeats", 0)) + 1
+        await r.hset(f"session:{session_id}", "missed_heartbeats", str(missed))
+        if missed >= HEARTBEAT_GAP_TOLERANCE:
+            flags.append(f"heartbeat_gaps:{missed}")
 
-    now_ts = time.time()
+    # ── Server-side signal #3: Play ratio detection ──
+    # If play_seconds is way less than elapsed time, something is off
+    # (e.g., pausing constantly while a script downloads segments)
+    play_delta = int(playback_events.get("play_seconds", 0)) if playback_events else 0
+    total_play = int(session.get("total_play_seconds", 0)) + play_delta
+    session_age = now - float(session.get("created_at", now))
+
+    if session_age > 120 and total_play > 0:  # after 2 minutes of session
+        play_ratio = total_play / session_age
+        if play_ratio < MIN_PLAY_RATIO:
+            flags.append(f"low_play_ratio:{play_ratio:.2f}")
+
+    # ── Server-side signal #4: Continuous play ──
+    if total_play > 0:
+        await r.hset(f"session:{session_id}", "total_play_seconds", str(total_play))
+        if total_play / 3600 > MAX_CONTINUOUS_PLAY_HOURS:
+            flags.append(f"continuous_play:{total_play / 3600:.1f}h")
+
+    # ── Server-side signal #5: Rapid session creation ──
+    creation_key = f"session_creations:{user_id}"
+    recent_creations = await r.zcount(creation_key, now - RAPID_SESSION_CREATION_WINDOW, now)
+    if recent_creations > RAPID_SESSION_CREATION_LIMIT:
+        flags.append(f"rapid_sessions:{recent_creations}/{RAPID_SESSION_CREATION_LIMIT}")
+
+    # ── Server-side signal #6: Ghost sessions ──
+    # Sessions created but never heartbeated
+    ghost_key = f"ghost_check:{user_id}"
+    ghost_members = await r.zrangebyscore(ghost_key, 0, now - SESSION_EXPIRY)
+    ghost_count = len(ghost_members)
+    if ghost_count >= GHOST_SESSION_THRESHOLD:
+        flags.append(f"ghost_sessions:{ghost_count}")
+    # Clear this session from ghost check (it heartbeated)
+    await r.zrem(ghost_key, session_id)
+
+    # ── Server-side signal #7: OTP rotation abuse ──
+    otp_rotations = int(session.get("otp_rotations", 0))
+    if session_age > 0 and otp_rotations > 0:
+        # Expected rotations: session_age / rotation_interval
+        # If actual rotations are 3x expected, that's suspicious
+        expected_rotations = session_age / 90  # 90s default rotation interval
+        if otp_rotations > max(10, expected_rotations * 3):
+            flags.append(f"rotation_abuse:{otp_rotations}")
+
+    # ── Determine risk level ──
+    risk_level = "normal"
+    if flags:
+        risk_level = "warning" if len(flags) < 3 else "blocked"
+
+    # Update heartbeat tracking
+    hb_count = int(session.get("heartbeat_count", 0)) + 1
     pipe = r.pipeline()
-    pipe.hset(f"session:{session_id}", "last_heartbeat", str(now_ts))
+    pipe.hset(f"session:{session_id}", "last_heartbeat", str(now))
+    pipe.hset(f"session:{session_id}", "heartbeat_count", str(hb_count))
     pipe.expire(f"session:{session_id}", SESSION_EXPIRY)
     await pipe.execute()
 
     # Collect debug info
     ttl = await r.ttl(f"session:{session_id}")
-    total_play = int(session.get("total_play_seconds", 0))
-    if playback_events:
-        total_play += int(playback_events.get("play_seconds", 0))
-
-    seek_key = f"seeks:{session_id}"
-    restart_key = f"restarts:{session_id}"
-    recent_seeks = await r.zcount(seek_key, now_ts - 60, now_ts)
-    recent_restarts = await r.zcard(restart_key)
-
     debug = {
         "session_ttl": ttl,
         "total_play_seconds": total_play,
         "ip_changes": int(session.get("ip_changes", 0)),
         "current_ip": ip_address or session.get("ip_address", ""),
-        "seeks_last_minute": recent_seeks,
-        "restarts_last_hour": recent_restarts,
-        "otp_rotations": int(session.get("otp_rotations", 0)),
+        "otp_rotations": otp_rotations,
+        "heartbeat_count": hb_count,
+        "missed_heartbeats": int(session.get("missed_heartbeats", 0)),
+        "session_age_seconds": int(session_age),
+        "play_ratio": round(total_play / session_age, 2) if session_age > 0 else 1.0,
+        "recent_session_creations": recent_creations,
+        "ghost_sessions": ghost_count,
+        "flags": flags,
     }
 
     return {"status": "alive", "expires_in": SESSION_EXPIRY, "risk_level": risk_level, "debug": debug}
 
 
-async def _analyze_playback_behavior(
-    session_id: str, session: dict, events: dict
-) -> list:
-    r = get_redis()
-    now = time.time()
-    flags = []
-
-    seek_count = int(events.get("seek_count", 0))
-    if seek_count > 0:
-        seek_key = f"seeks:{session_id}"
-        pipe = r.pipeline()
-        for i in range(seek_count):
-            pipe.zadd(seek_key, {f"{now}:{i}": now})
-        pipe.zremrangebyscore(seek_key, 0, now - 120)
-        pipe.expire(seek_key, 300)
-        await pipe.execute()
-        recent = await r.zcount(seek_key, now - 60, now)
-        if recent > MAX_SEEKS_PER_MINUTE:
-            flags.append(f"excessive_seeking:{recent}/min")
-
-    restart_count = int(events.get("restart_count", 0))
-    if restart_count > 0:
-        restart_key = f"restarts:{session_id}"
-        pipe = r.pipeline()
-        for i in range(restart_count):
-            pipe.zadd(restart_key, {f"{now}:{i}": now})
-        pipe.zremrangebyscore(restart_key, 0, now - 3600)
-        pipe.expire(restart_key, 3700)
-        await pipe.execute()
-        total = await r.zcard(restart_key)
-        if total > MAX_RESTARTS_PER_HOUR:
-            flags.append(f"rapid_restarts:{total}/hr")
-
-    play_delta = int(events.get("play_seconds", 0))
-    if play_delta > 0:
-        total = int(session.get("total_play_seconds", 0)) + play_delta
-        await r.hset(f"session:{session_id}", "total_play_seconds", str(total))
-        if total / 3600 > MAX_CONTINUOUS_PLAY_HOURS:
-            flags.append(f"continuous_play:{total / 3600:.1f}h")
-
-    return flags
-
-
 async def validate_session_for_rotation(
     session_id: str, video_id: str, user_id: str
 ) -> dict:
-    """
-    Validate that a session exists, belongs to the user,
-    and matches the video. Used before issuing a rotated OTP.
-    """
     session = await _get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -194,7 +219,6 @@ async def validate_session_for_rotation(
     if session.get("video_id") != video_id:
         raise HTTPException(status_code=400, detail="Video ID does not match session")
 
-    # Track rotation count
     r = get_redis()
     count = await r.hincrby(f"session:{session_id}", "otp_rotations", 1)
 
@@ -208,10 +232,9 @@ async def end_session(session_id: str) -> None:
         user_id = session.get("user_id", "")
         pipe = r.pipeline()
         pipe.delete(f"session:{session_id}")
-        pipe.delete(f"seeks:{session_id}")
-        pipe.delete(f"restarts:{session_id}")
         if user_id:
             pipe.srem(f"user_sessions:{user_id}", session_id)
+            pipe.zrem(f"ghost_check:{user_id}", session_id)
         await pipe.execute()
 
 

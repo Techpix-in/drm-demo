@@ -215,14 +215,20 @@ class ApiClient {
       status: string;
       expires_in: number;
       risk_level: string;
+      flags: string[];
       debug: {
         session_ttl: number;
         total_play_seconds: number;
         ip_changes: number;
         current_ip: string;
-        seeks_last_minute: number;
-        restarts_last_hour: number;
         otp_rotations: number;
+        heartbeat_count: number;
+        missed_heartbeats: number;
+        session_age_seconds: number;
+        play_ratio: number;
+        recent_session_creations: number;
+        ghost_sessions: number;
+        flags: string[];
       };
     }>("/api/playback/heartbeat", {
       method: "POST",
