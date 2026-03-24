@@ -146,7 +146,7 @@ Player loads → OTP #1 (120s TTL)
 
 **Implementation:**
 - Backend: `POST /api/video/otp/rotate` — validates session ownership before issuing fresh OTP
-- Frontend: `VdoPlayer.tsx` runs a rotation interval timer, reloads iframe with new OTP
+- Frontend: `VdoPlayer.tsx` runs a rotation interval timer that calls the rotate endpoint server-side. The iframe is **not reloaded** — the player continues uninterrupted while the backend logs fresh OTP generation and keeps the session alive
 
 ---
 
@@ -213,9 +213,9 @@ The backend analyzes these for piracy patterns:
 
 | Behavior | Threshold | Risk Points | Why Suspicious |
 |----------|-----------|-------------|----------------|
-| Excessive seeking | >15 seeks/minute | +25 | Ripping tools scrub through video fast |
-| Rapid restarts | >10 restarts/hour | +25 | Automation scripts restart for fresh DRM keys |
-| Continuous play | >8 hours nonstop | +25 | No human watches 8h+ — likely a bot |
+| Excessive seeking | >30 seeks/minute | +25 | Ripping tools scrub through video fast |
+| Rapid restarts | >15 restarts/hour | +25 | Automation scripts restart for fresh DRM keys |
+| Continuous play | >10 hours nonstop | +25 | No human watches 10h+ — likely a bot |
 
 **Risk Score System:**
 ```
@@ -224,6 +224,10 @@ The backend analyzes these for piracy patterns:
 100+ points   → "blocked" — session terminated, account flagged
 Points decay after 1 hour → legitimate users recover
 ```
+
+**Escalation:** Risk points are only added to the global user score when the heartbeat returns `"blocked"` (3+ simultaneous flags). Warnings are logged but don't accumulate risk — this prevents false positives during normal viewing.
+
+**Tuning notes:** Thresholds are intentionally generous to avoid blocking legitimate viewers. A normal viewer will never hit 30 seeks in a minute — that's physically someone dragging the scrubber non-stop. Only automated ripping tools produce these patterns.
 
 **Storage:** Seek timestamps, restart timestamps, and play duration are stored as Redis sorted sets with automatic expiry. Only the last 2 minutes of seeks and last 1 hour of restarts are retained.
 
@@ -242,8 +246,10 @@ Heartbeat 4: IP 9.10.11.12 → IP change #2 (logged)
 Heartbeat 5: IP 13.14.15.16 → IP change #3 → SESSION TERMINATED
 ```
 
-**Impossible Travel:**
-If the same user makes requests from different IPs within 5 minutes, +30 risk points are added. This catches token sharing or VPN switching during a rip.
+**Impossible Travel Detection:**
+Detects when the same user makes requests from different IPs within 5 minutes. This catches token sharing or VPN switching during a rip.
+
+> **Note:** Impossible travel detection runs on login/auth requests only — not on OTP or playback endpoints. This avoids false positives caused by proxy IP variance (Cloudflare/Vercel edge nodes can report different IPs for the same user). IP monitoring during playback is handled per-session via heartbeat instead.
 
 ---
 
@@ -329,12 +335,16 @@ Each log entry includes: `user_id`, `ip_address`, `details` (JSON), `created_at`
 **CSP Headers (Next.js):**
 ```
 default-src 'self'
-frame-src   https://player.vdocipher.com     ← VdoCipher player iframe
-connect-src 'self' https://dev.vdocipher.com ← OTP API calls
-script-src  'self' 'unsafe-inline' 'unsafe-eval'
-style-src   'self' 'unsafe-inline'
+frame-src   https://player.vdocipher.com https://*.vdocipher.com
+connect-src 'self' https://*.vdocipher.com https://*.cloudfront.net
+script-src  'self' 'unsafe-inline' 'unsafe-eval' https://*.vdocipher.com
+style-src   'self' 'unsafe-inline' https://*.vdocipher.com
+media-src   'self' https://*.vdocipher.com https://*.cloudfront.net blob:
 img-src     'self' data: https:
+worker-src  'self' blob:
 ```
+
+CSP is widened to allow VdoCipher's player to load scripts, styles, media segments, and DRM license requests from its CDN (CloudFront). `blob:` is required for media source extensions (MSE) used by adaptive streaming.
 
 ---
 
@@ -553,7 +563,7 @@ User                VdoPlayer              Backend              VdoCipher    Red
  │── click play ──────→│                      │                     │          │
  │                     │── POST /video/otp ──→│                     │          │
  │                     │                      │── create session ──────────────→│
- │                     │                      │── anomaly check ───────────────→│
+ │                     │                      │── rate limit check ────────────→│
  │                     │                      │── generate OTP ────→│          │
  │                     │                      │←── otp + playback ──│          │
  │                     │←── otp + session_id ─│                     │          │
@@ -573,8 +583,8 @@ User                VdoPlayer              Backend              VdoCipher    Red
  │   │                 │                      │                  │  │          │
  │   │                 │── POST /otp/rotate ─→│                  │  │          │
  │   │                 │                      │── fresh OTP ────→│  │          │
- │   │                 │←── new otp ──────────│                  │  │          │
- │   │                 │══ reload iframe ═════════════════════════│  │          │
+ │   │                 │←── ack ──────────────│                  │  │          │
+ │   │                 │   (iframe NOT reloaded — playback continues)│          │
  │   │                 │                      │                  │  │          │
  │   └─────────────────┼──────────────────────┼──────────────────┘  │          │
  │                     │                      │                     │          │
@@ -616,10 +626,10 @@ LOGIN_RATE_WINDOW=900           # 15 minutes
 OTP_RATE_LIMIT=10
 OTP_RATE_WINDOW=60
 
-# Behavioral Detection
-MAX_SEEKS_PER_MINUTE=15
-MAX_RESTARTS_PER_HOUR=10
-MAX_CONTINUOUS_PLAY_HOURS=8
+# Behavioral Detection (tuned to avoid false positives)
+MAX_SEEKS_PER_MINUTE=30
+MAX_RESTARTS_PER_HOUR=15
+MAX_CONTINUOUS_PLAY_HOURS=10
 RISK_SCORE_THRESHOLD=100
 
 # CORS
