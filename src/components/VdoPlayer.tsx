@@ -84,12 +84,22 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
     pushDebug();
   }, [pushDebug]);
 
-  // Track seeks via iframe message events
+  // Seek detection: VdoCipher's iframe is cross-origin and does not emit
+  // seek events via postMessage. Seek tracking requires either:
+  // 1. VdoCipher's native mobile SDK (gives direct player event access)
+  // 2. A custom player (Shaka/dash.js) with your own DRM license server
+  //
+  // For the iframe embed, we track restarts (OTP re-requests) and
+  // continuous play time instead. Seek detection is a limitation of
+  // third-party iframe-based players.
+  //
+  // We still listen for any messages VdoCipher might send in the future:
   const handleMessage = useCallback((event: MessageEvent) => {
-    if (event.origin !== "https://player.vdocipher.com") return;
     try {
       const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-      if (data.event === "seeked" || data.event === "seeking") {
+      if (!data) return;
+      const eventName = data.event || data.type || data.name || "";
+      if (["seeked", "seeking", "seek"].includes(eventName)) {
         seekCountRef.current += 1;
       }
     } catch {
@@ -110,9 +120,13 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
   }, [debug, pushDebug]);
 
   useEffect(() => {
+    let mounted = true;
+
     async function fetchOTP() {
+      if (!mounted) return;
       try {
         const data = await api.getOTP(videoId);
+        if (!mounted) return;
         setIframeSrc(
           `https://player.vdocipher.com/v2/?otp=${data.otp}&playbackInfo=${data.playback_info}`
         );
@@ -244,11 +258,13 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
     fetchOTP();
 
     return () => {
+      mounted = false;
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
       if (rotationRef.current) clearInterval(rotationRef.current);
       if (debugPollRef.current) clearInterval(debugPollRef.current);
       if (sessionIdRef.current) {
         api.endSession(sessionIdRef.current).catch(() => {});
+        sessionIdRef.current = null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
