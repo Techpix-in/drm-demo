@@ -66,13 +66,17 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
   });
   const debugEventsRef = useRef<DebugEvent[]>([]);
 
+  const debugRef = useRef(debug);
+  const onDebugUpdateRef = useRef(onDebugUpdate);
+  debugRef.current = debug;
+  onDebugUpdateRef.current = onDebugUpdate;
+
   const pushDebug = useCallback(() => {
-    if (!debug || !onDebugUpdate) return;
-    // Update live counters
+    if (!debugRef.current || !onDebugUpdateRef.current) return;
     debugDataRef.current.seeksSinceHeartbeat = seekCountRef.current;
     debugDataRef.current.restartsSinceHeartbeat = restartCountRef.current;
-    onDebugUpdate({ ...debugDataRef.current }, [...debugEventsRef.current]);
-  }, [debug, onDebugUpdate]);
+    onDebugUpdateRef.current({ ...debugDataRef.current }, [...debugEventsRef.current]);
+  }, []);
 
   const addEvent = useCallback((type: DebugEvent["type"], message: string, details?: Record<string, unknown>) => {
     debugEventsRef.current.unshift({ time: nowTime(), type, message, details });
@@ -247,7 +251,8 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
         api.endSession(sessionIdRef.current).catch(() => {});
       }
     };
-  }, [videoId, debug, addEvent, pushDebug]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId]);
 
   if (loading) {
     return (
