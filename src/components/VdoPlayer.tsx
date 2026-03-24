@@ -8,8 +8,7 @@ interface VdoPlayerProps {
 }
 
 export default function VdoPlayer({ videoId }: VdoPlayerProps) {
-  const [otp, setOtp] = useState<string | null>(null);
-  const [playbackInfo, setPlaybackInfo] = useState<string | null>(null);
+  const [iframeSrc, setIframeSrc] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [tier, setTier] = useState<string>("browser");
@@ -47,8 +46,9 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
     async function fetchOTP() {
       try {
         const data = await api.getOTP(videoId);
-        setOtp(data.otp);
-        setPlaybackInfo(data.playback_info);
+        setIframeSrc(
+          `https://player.vdocipher.com/v2/?otp=${data.otp}&playbackInfo=${data.playback_info}`
+        );
         setTier(data.tier || "browser");
         setMaxRes(data.max_resolution || "480p");
         sessionIdRef.current = data.session_id;
@@ -107,8 +107,8 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
 
         try {
           const data = await api.rotateOTP(sessionIdRef.current, videoId);
-          setOtp(data.otp);
-          setPlaybackInfo(data.playback_info);
+          // Don't update iframe src — that would restart the player.
+          // Rotation keeps the server session alive and logs fresh OTP generation.
           setRotationCount((c) => c + 1);
 
           // Update interval if server changed it
@@ -158,7 +158,7 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
   return (
     <div className="aspect-video bg-black rounded-lg overflow-hidden relative">
       <iframe
-        src={`https://player.vdocipher.com/v2/?otp=${otp}&playbackInfo=${playbackInfo}`}
+        src={iframeSrc!}
         style={{ width: "100%", height: "100%", border: 0 }}
         allow="encrypted-media"
         allowFullScreen
