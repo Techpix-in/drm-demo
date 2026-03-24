@@ -102,7 +102,7 @@ async def heartbeat(
     if playback_events:
         flags = await _analyze_playback_behavior(session_id, session, playback_events)
         if flags:
-            risk_level = "warning" if len(flags) < 2 else "blocked"
+            risk_level = "warning" if len(flags) < 3 else "blocked"
 
     pipe = r.pipeline()
     pipe.hset(f"session:{session_id}", "last_heartbeat", str(time.time()))

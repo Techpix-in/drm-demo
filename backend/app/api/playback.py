@@ -42,7 +42,9 @@ async def get_otp(
     client_tier = body.client_tier or "browser"
 
     await check_otp_rate_limit(request, user)
-    await analyze_request(user.user_id, ip, fingerprint)
+    # Skip analyze_request here — it causes false positives behind
+    # proxies (Cloudflare/Vercel) where X-Forwarded-For IPs vary.
+    # IP monitoring is done per-session in heartbeat instead.
 
     video = await get_video_by_id(body.video_id)
     if not video:
@@ -147,8 +149,8 @@ async def playback_heartbeat(
         playback_events=body.playback_events or {},
     )
 
-    if result.get("risk_level") == "warning":
-        await add_risk_points(user.user_id, BEHAVIORAL_RISK_POINTS, "behavioral_anomaly", ip=ip)
+    if result.get("risk_level") == "blocked":
+        await add_risk_points(user.user_id, BEHAVIORAL_RISK_POINTS, "behavioral_blocked", ip=ip)
 
     return HeartbeatResponse(**result)
 

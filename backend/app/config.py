@@ -48,8 +48,9 @@ IMPOSSIBLE_TRAVEL_WINDOW = 300
 RISK_SCORE_THRESHOLD = 100
 RISK_SCORE_DECAY_SECONDS = 3600
 
-# Behavioral detection
-MAX_SEEKS_PER_MINUTE = 15
-MAX_RESTARTS_PER_HOUR = 10
-MAX_CONTINUOUS_PLAY_HOURS = 8
+# Behavioral detection — thresholds tuned to avoid false positives
+# Normal viewers rarely hit these; only automated tools do
+MAX_SEEKS_PER_MINUTE = 30
+MAX_RESTARTS_PER_HOUR = 15
+MAX_CONTINUOUS_PLAY_HOURS = 10
 BEHAVIORAL_RISK_POINTS = 25
