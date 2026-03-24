@@ -215,6 +215,15 @@ class ApiClient {
       status: string;
       expires_in: number;
       risk_level: string;
+      debug: {
+        session_ttl: number;
+        total_play_seconds: number;
+        ip_changes: number;
+        current_ip: string;
+        seeks_last_minute: number;
+        restarts_last_hour: number;
+        otp_rotations: number;
+      };
     }>("/api/playback/heartbeat", {
       method: "POST",
       body: JSON.stringify({
@@ -236,6 +245,32 @@ class ApiClient {
       sessions: { session_id: string; video_id: string }[];
       max_allowed: number;
     }>("/api/playback/sessions");
+  }
+
+  async getDebugInfo(sessionId: string) {
+    return this.request<{
+      session: {
+        session_id: string;
+        video_id: string;
+        device_fingerprint: string;
+        ip_address: string;
+        created_at: number;
+        last_heartbeat: number;
+        total_play_seconds: number;
+        ip_changes: number;
+        otp_rotations: number;
+        ttl: number;
+      };
+      rate_limits: {
+        otp: { used: number; limit: number; window: number };
+        login: { used: number; limit: number; window: number };
+      };
+      risk: {
+        score: number;
+        threshold: number;
+        status: string;
+      };
+    }>(`/api/playback/debug/${sessionId}`);
   }
 }
 

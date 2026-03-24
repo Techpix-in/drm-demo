@@ -63,6 +63,13 @@ class HeartbeatResponse(BaseModel):
     status: str
     expires_in: int
     risk_level: str = "normal"
+    debug: dict = {}
+
+
+class DebugInfoResponse(BaseModel):
+    session: dict = {}
+    rate_limits: dict = {}
+    risk: dict = {}
 
 
 class PlaybackSession(BaseModel):

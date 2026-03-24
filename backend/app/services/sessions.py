@@ -104,12 +104,34 @@ async def heartbeat(
         if flags:
             risk_level = "warning" if len(flags) < 3 else "blocked"
 
+    now_ts = time.time()
     pipe = r.pipeline()
-    pipe.hset(f"session:{session_id}", "last_heartbeat", str(time.time()))
+    pipe.hset(f"session:{session_id}", "last_heartbeat", str(now_ts))
     pipe.expire(f"session:{session_id}", SESSION_EXPIRY)
     await pipe.execute()
 
-    return {"status": "alive", "expires_in": SESSION_EXPIRY, "risk_level": risk_level}
+    # Collect debug info
+    ttl = await r.ttl(f"session:{session_id}")
+    total_play = int(session.get("total_play_seconds", 0))
+    if playback_events:
+        total_play += int(playback_events.get("play_seconds", 0))
+
+    seek_key = f"seeks:{session_id}"
+    restart_key = f"restarts:{session_id}"
+    recent_seeks = await r.zcount(seek_key, now_ts - 60, now_ts)
+    recent_restarts = await r.zcard(restart_key)
+
+    debug = {
+        "session_ttl": ttl,
+        "total_play_seconds": total_play,
+        "ip_changes": int(session.get("ip_changes", 0)),
+        "current_ip": ip_address or session.get("ip_address", ""),
+        "seeks_last_minute": recent_seeks,
+        "restarts_last_hour": recent_restarts,
+        "otp_rotations": int(session.get("otp_rotations", 0)),
+    }
+
+    return {"status": "alive", "expires_in": SESSION_EXPIRY, "risk_level": risk_level, "debug": debug}
 
 
 async def _analyze_playback_behavior(

@@ -5,6 +5,11 @@ from app.config import (
     BEHAVIORAL_RISK_POINTS,
     OTP_ROTATION_INTERVAL_BROWSER,
     OTP_ROTATION_INTERVAL_MOBILE,
+    OTP_RATE_LIMIT,
+    OTP_RATE_WINDOW,
+    LOGIN_RATE_LIMIT,
+    LOGIN_RATE_WINDOW,
+    RISK_SCORE_THRESHOLD,
 )
 from app.models.schemas import (
     OTPRequest,
@@ -13,11 +18,13 @@ from app.models.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
     ActiveSessionsResponse,
+    DebugInfoResponse,
     SessionUser,
 )
 from app.core.auth import get_current_user
 from app.core.middleware import get_client_ip, get_device_fingerprint, check_otp_rate_limit
-from app.core.security import analyze_request, audit_log, add_risk_points
+from app.core.security import audit_log, add_risk_points, get_risk_score
+from app.db.redis import get_redis
 from app.services.sessions import (
     create_playback_session,
     heartbeat as session_heartbeat,
@@ -165,3 +172,61 @@ async def stop_session(session_id: str, user: SessionUser = Depends(get_current_
 async def list_sessions(user: SessionUser = Depends(get_current_user)):
     sessions = await get_user_sessions(user.user_id)
     return ActiveSessionsResponse(sessions=sessions, max_allowed=MAX_CONCURRENT_STREAMS)
+
+
+@router.get("/playback/debug/{session_id}", response_model=DebugInfoResponse)
+async def get_debug_info(
+    session_id: str,
+    request: Request,
+    user: SessionUser = Depends(get_current_user),
+):
+    """Return debug info: session state, rate limits, risk score."""
+    import time
+
+    r = get_redis()
+    now = time.time()
+
+    # Session info
+    session_data = await r.hgetall(f"session:{session_id}")
+    session_ttl = await r.ttl(f"session:{session_id}")
+    session_info = {}
+    if session_data:
+        session_info = {
+            "session_id": session_data.get("session_id", ""),
+            "video_id": session_data.get("video_id", ""),
+            "device_fingerprint": session_data.get("device_fingerprint", "")[:8] + "...",
+            "ip_address": session_data.get("ip_address", ""),
+            "created_at": float(session_data.get("created_at", 0)),
+            "last_heartbeat": float(session_data.get("last_heartbeat", 0)),
+            "total_play_seconds": int(session_data.get("total_play_seconds", 0)),
+            "ip_changes": int(session_data.get("ip_changes", 0)),
+            "otp_rotations": int(session_data.get("otp_rotations", 0)),
+            "ttl": session_ttl,
+        }
+
+    # Rate limits
+    otp_key = f"ratelimit:otp:{user.user_id}"
+    await r.zremrangebyscore(otp_key, 0, now - OTP_RATE_WINDOW)
+    otp_used = await r.zcard(otp_key)
+
+    ip = get_client_ip(request)
+    login_key = f"ratelimit:login:{ip}"
+    await r.zremrangebyscore(login_key, 0, now - LOGIN_RATE_WINDOW)
+    login_used = await r.zcard(login_key)
+
+    rate_limits = {
+        "otp": {"used": otp_used, "limit": OTP_RATE_LIMIT, "window": OTP_RATE_WINDOW},
+        "login": {"used": login_used, "limit": LOGIN_RATE_LIMIT, "window": LOGIN_RATE_WINDOW},
+    }
+
+    # Risk score
+    risk_score = await get_risk_score(user.user_id)
+    risk_info = {
+        "score": risk_score,
+        "threshold": RISK_SCORE_THRESHOLD,
+        "status": "blocked" if risk_score >= RISK_SCORE_THRESHOLD else (
+            "warning" if risk_score >= RISK_SCORE_THRESHOLD * 0.5 else "normal"
+        ),
+    }
+
+    return DebugInfoResponse(session=session_info, rate_limits=rate_limits, risk=risk_info)

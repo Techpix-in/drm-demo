@@ -1,8 +1,11 @@
 "use client";
 
 import { useEffect, useState, use } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import VdoPlayer from "@/components/VdoPlayer";
+import DebugPanel from "@/components/DebugPanel";
+import type { DebugData, DebugEvent } from "@/components/DebugPanel";
 import LoginForm from "@/components/LoginForm";
 import { useAuth } from "@/components/AuthProvider";
 import { api } from "@/lib/api";
@@ -21,13 +24,18 @@ interface WatchPageProps {
 
 export default function WatchPage({ params }: WatchPageProps) {
   const { videoId } = use(params);
+  const searchParams = useSearchParams();
+  const isDebug = searchParams.get("debug") === "true";
   const { user, loading: authLoading } = useAuth();
   const [video, setVideo] = useState<Video | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Debug state
+  const [debugData, setDebugData] = useState<DebugData | null>(null);
+  const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
+
   useEffect(() => {
     if (!user) return;
-    // We fetch videos list and find the one we need
     api
       .getVideos()
       .then((data) => {
@@ -93,8 +101,20 @@ export default function WatchPage({ params }: WatchPageProps) {
 
       {/* Player */}
       <div className="mt-4">
-        <VdoPlayer videoId={videoId} />
+        <VdoPlayer
+          videoId={videoId}
+          debug={isDebug}
+          onDebugUpdate={(data, events) => {
+            setDebugData(data);
+            setDebugEvents(events);
+          }}
+        />
       </div>
+
+      {/* Debug Panel — only when ?debug=true */}
+      {isDebug && debugData && (
+        <DebugPanel data={debugData} events={debugEvents} />
+      )}
 
       {/* Video Info */}
       <div className="mt-6">
@@ -108,6 +128,11 @@ export default function WatchPage({ params }: WatchPageProps) {
             Watermarked
           </span>
           <span className="text-xs text-gray-500">{video.duration}</span>
+          {isDebug && (
+            <span className="text-xs bg-yellow-900/50 text-yellow-400 px-2 py-1 rounded">
+              Debug Mode
+            </span>
+          )}
         </div>
       </div>
 
@@ -135,6 +160,13 @@ export default function WatchPage({ params }: WatchPageProps) {
           </p>
         </div>
       </div>
+
+      {/* Debug hint */}
+      {!isDebug && (
+        <p className="text-xs text-gray-600 mt-4 text-center">
+          Tip: Add <code className="text-gray-500">?debug=true</code> to the URL to see the developer debug panel
+        </p>
+      )}
     </div>
   );
 }

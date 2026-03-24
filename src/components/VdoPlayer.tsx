@@ -2,12 +2,39 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 import { api } from "@/lib/api";
+import type { DebugData, DebugEvent } from "./DebugPanel";
 
 interface VdoPlayerProps {
   videoId: string;
+  debug?: boolean;
+  onDebugUpdate?: (data: DebugData, events: DebugEvent[]) => void;
 }
 
-export default function VdoPlayer({ videoId }: VdoPlayerProps) {
+function getDeviceFingerprint(): string {
+  if (typeof window === "undefined") return "server";
+  const raw = [
+    navigator.userAgent,
+    screen.width,
+    screen.height,
+    screen.colorDepth,
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    navigator.language,
+    navigator.hardwareConcurrency,
+  ].join("|");
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function nowTime(): string {
+  return new Date().toLocaleTimeString("en-US", { hour12: false });
+}
+
+export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: VdoPlayerProps) {
   const [iframeSrc, setIframeSrc] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -17,12 +44,41 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
   const sessionIdRef = useRef<string | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const rotationRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const rotationIntervalRef = useRef(90); // seconds, updated from server
+  const debugPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rotationIntervalRef = useRef(90);
 
   // Behavioral tracking refs
   const seekCountRef = useRef(0);
   const restartCountRef = useRef(0);
   const lastHeartbeatTimeRef = useRef(Date.now());
+
+  // Debug state refs (avoid re-renders, push via callback)
+  const debugDataRef = useRef<DebugData>({
+    sessionId: null, tier: "browser", maxRes: "480p",
+    deviceFingerprint: getDeviceFingerprint(),
+    createdAt: null, lastHeartbeat: null, heartbeatStatus: "",
+    riskLevel: "normal", sessionTtl: 90, totalPlaySeconds: 0,
+    ipChanges: 0, currentIp: "", seeksLastMinute: 0,
+    restartsLastHour: 0, otpRotations: 0, rotationInterval: 90,
+    lastRotation: null, seeksSinceHeartbeat: 0,
+    restartsSinceHeartbeat: 0, rateLimits: null,
+    riskScore: 0, riskThreshold: 100, riskStatus: "normal",
+  });
+  const debugEventsRef = useRef<DebugEvent[]>([]);
+
+  const pushDebug = useCallback(() => {
+    if (!debug || !onDebugUpdate) return;
+    // Update live counters
+    debugDataRef.current.seeksSinceHeartbeat = seekCountRef.current;
+    debugDataRef.current.restartsSinceHeartbeat = restartCountRef.current;
+    onDebugUpdate({ ...debugDataRef.current }, [...debugEventsRef.current]);
+  }, [debug, onDebugUpdate]);
+
+  const addEvent = useCallback((type: DebugEvent["type"], message: string, details?: Record<string, unknown>) => {
+    debugEventsRef.current.unshift({ time: nowTime(), type, message, details });
+    if (debugEventsRef.current.length > 100) debugEventsRef.current.pop();
+    pushDebug();
+  }, [pushDebug]);
 
   // Track seeks via iframe message events
   const handleMessage = useCallback((event: MessageEvent) => {
@@ -33,7 +89,7 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
         seekCountRef.current += 1;
       }
     } catch {
-      // not a JSON message, ignore
+      // not a JSON message
     }
   }, []);
 
@@ -41,6 +97,13 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
   }, [handleMessage]);
+
+  // Live counter update for debug panel (every 1s)
+  useEffect(() => {
+    if (!debug) return;
+    const interval = setInterval(pushDebug, 1000);
+    return () => clearInterval(interval);
+  }, [debug, pushDebug]);
 
   useEffect(() => {
     async function fetchOTP() {
@@ -54,6 +117,16 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
         sessionIdRef.current = data.session_id;
         rotationIntervalRef.current = data.rotation_interval || 90;
         lastHeartbeatTimeRef.current = Date.now();
+
+        // Update debug
+        debugDataRef.current.sessionId = data.session_id;
+        debugDataRef.current.tier = data.tier || "browser";
+        debugDataRef.current.maxRes = data.max_resolution || "480p";
+        debugDataRef.current.rotationInterval = data.rotation_interval || 90;
+        debugDataRef.current.createdAt = Date.now();
+        debugDataRef.current.lastRotation = Date.now();
+        addEvent("SESSION", `Created session ${data.session_id.slice(0, 12)}...`);
+        addEvent("OTP_CREATED", `OTP #1 (tier: ${data.tier}, res: ${data.max_resolution})`);
 
         // Start heartbeat every 30 seconds
         heartbeatRef.current = setInterval(async () => {
@@ -69,37 +142,63 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
             play_seconds: Math.round(elapsed),
           };
 
+          const seekSnapshot = seekCountRef.current;
+          const restartSnapshot = restartCountRef.current;
           seekCountRef.current = 0;
           restartCountRef.current = 0;
 
           try {
-            const result = await api.sendHeartbeat(
-              sessionIdRef.current,
-              events
+            const result = await api.sendHeartbeat(sessionIdRef.current, events);
+
+            // Update debug
+            debugDataRef.current.lastHeartbeat = Date.now();
+            debugDataRef.current.heartbeatStatus = result.status;
+            debugDataRef.current.riskLevel = result.risk_level;
+            if (result.debug) {
+              debugDataRef.current.sessionTtl = result.debug.session_ttl;
+              debugDataRef.current.totalPlaySeconds = result.debug.total_play_seconds;
+              debugDataRef.current.ipChanges = result.debug.ip_changes;
+              debugDataRef.current.currentIp = result.debug.current_ip;
+              debugDataRef.current.seeksLastMinute = result.debug.seeks_last_minute;
+              debugDataRef.current.restartsLastHour = result.debug.restarts_last_hour;
+              debugDataRef.current.otpRotations = result.debug.otp_rotations;
+            }
+
+            addEvent(
+              result.risk_level === "normal" ? "HEARTBEAT" : "WARNING",
+              `${result.risk_level} (seeks:${seekSnapshot}, restarts:${restartSnapshot}, play:${Math.round(elapsed)}s)`
             );
+
             if (result.risk_level === "blocked") {
-              setError(
-                "Playback suspended due to unusual activity. Please try again later."
-              );
+              setError("Playback suspended due to unusual activity. Please try again later.");
               if (heartbeatRef.current) clearInterval(heartbeatRef.current);
               if (rotationRef.current) clearInterval(rotationRef.current);
+              if (debugPollRef.current) clearInterval(debugPollRef.current);
+              addEvent("ERROR", "Session blocked — playback stopped");
             }
           } catch {
             if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+            addEvent("ERROR", "Heartbeat failed — timer stopped");
           }
         }, 30000);
 
         // Start OTP rotation
         startOTPRotation();
+
+        // Start debug polling (rate limits + risk score)
+        if (debug) {
+          fetchDebugInfo();
+          debugPollRef.current = setInterval(fetchDebugInfo, 15000);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load video");
+        addEvent("ERROR", err instanceof Error ? err.message : "Failed to load video");
       } finally {
         setLoading(false);
       }
     }
 
     function startOTPRotation() {
-      // Clear any existing rotation timer
       if (rotationRef.current) clearInterval(rotationRef.current);
 
       rotationRef.current = setInterval(async () => {
@@ -107,19 +206,35 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
 
         try {
           const data = await api.rotateOTP(sessionIdRef.current, videoId);
-          // Don't update iframe src — that would restart the player.
-          // Rotation keeps the server session alive and logs fresh OTP generation.
           setRotationCount((c) => c + 1);
+          debugDataRef.current.lastRotation = Date.now();
+          debugDataRef.current.otpRotations = (debugDataRef.current.otpRotations || 0) + 1;
 
-          // Update interval if server changed it
           if (data.rotation_interval) {
             rotationIntervalRef.current = data.rotation_interval;
+            debugDataRef.current.rotationInterval = data.rotation_interval;
           }
+
+          addEvent("OTP_ROTATED", `OTP #${debugDataRef.current.otpRotations + 1} issued`);
         } catch (err) {
-          // If rotation fails, player continues with current OTP until it expires
           console.warn("OTP rotation failed:", err);
+          addEvent("WARNING", `OTP rotation failed: ${err instanceof Error ? err.message : "unknown"}`);
         }
       }, rotationIntervalRef.current * 1000);
+    }
+
+    async function fetchDebugInfo() {
+      if (!sessionIdRef.current) return;
+      try {
+        const info = await api.getDebugInfo(sessionIdRef.current);
+        debugDataRef.current.rateLimits = info.rate_limits;
+        debugDataRef.current.riskScore = info.risk.score;
+        debugDataRef.current.riskThreshold = info.risk.threshold;
+        debugDataRef.current.riskStatus = info.risk.status;
+        pushDebug();
+      } catch {
+        // Debug endpoint failure is non-critical
+      }
     }
 
     fetchOTP();
@@ -127,11 +242,12 @@ export default function VdoPlayer({ videoId }: VdoPlayerProps) {
     return () => {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
       if (rotationRef.current) clearInterval(rotationRef.current);
+      if (debugPollRef.current) clearInterval(debugPollRef.current);
       if (sessionIdRef.current) {
         api.endSession(sessionIdRef.current).catch(() => {});
       }
     };
-  }, [videoId]);
+  }, [videoId, debug, addEvent, pushDebug]);
 
   if (loading) {
     return (
