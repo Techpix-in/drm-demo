@@ -58,7 +58,7 @@ export default function VdoPlayer({ videoId, debug = false, onDebugUpdate }: Vdo
     deviceFingerprint: getDeviceFingerprint(),
     createdAt: null, lastHeartbeat: null, heartbeatStatus: "",
     riskLevel: "normal", sessionTtl: 90, totalPlaySeconds: 0,
-    ipChanges: 0, currentIp: "", seeksLastMinute: 0,
+    ipChanges: 0, currentIp: "",
     otpRotations: 0, rotationInterval: 90,
     lastRotation: null,
     heartbeatCount: 0, missedHeartbeats: 0, sessionAgeSeconds: 0,
