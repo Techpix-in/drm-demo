@@ -39,7 +39,7 @@ export default function LoginForm() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-              placeholder="viewer@example.com"
+              placeholder="Enter your email"
               required
             />
           </div>
@@ -52,7 +52,7 @@ export default function LoginForm() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-              placeholder="demo123"
+              placeholder="Enter your password"
               required
             />
           </div>
@@ -69,12 +69,6 @@ export default function LoginForm() {
             {loading ? "Signing in..." : "Sign In"}
           </button>
         </form>
-
-        <div className="mt-6 p-3 bg-gray-800/50 rounded text-xs text-gray-500">
-          <p className="font-medium text-gray-400 mb-1">Demo credentials:</p>
-          <p>Email: viewer@example.com</p>
-          <p>Password: demo123</p>
-        </div>
       </div>
     </div>
   );
