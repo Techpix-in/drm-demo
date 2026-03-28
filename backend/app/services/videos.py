@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from app.db.postgres import async_session, VideoDB
 from app.models.schemas import Video
 from app.services.vdocipher import fetch_all_videos_from_vdocipher
@@ -71,6 +71,14 @@ async def sync_videos_from_vdocipher() -> dict:
                     is_active=True,
                 ))
                 added += 1
+
+        # Deactivate videos no longer in VdoCipher
+        vdocipher_ids = {v["id"] for v in vdocipher_videos}
+        await session.execute(
+            update(VideoDB)
+            .where(VideoDB.id.notin_(vdocipher_ids), VideoDB.is_active == True)
+            .values(is_active=False)
+        )
 
         await session.commit()
 
