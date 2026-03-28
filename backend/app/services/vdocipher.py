@@ -13,9 +13,9 @@ from app.models.schemas import SessionUser
 
 
 TIER_CONFIG = {
-    "browser": {"ttl": OTP_TTL_BROWSER, "max_resolution": "480p", "watermark": True},
-    "mobile_app": {"ttl": OTP_TTL_MOBILE, "max_resolution": "1080p", "watermark": True},
-    "smart_tv": {"ttl": OTP_TTL_MOBILE, "max_resolution": "4k", "watermark": True},
+    "browser": {"ttl": OTP_TTL_BROWSER, "max_resolution": "480p"},
+    "mobile_app": {"ttl": OTP_TTL_MOBILE, "max_resolution": "1080p"},
+    "smart_tv": {"ttl": OTP_TTL_MOBILE, "max_resolution": "4k"},
 }
 
 
@@ -96,6 +96,7 @@ async def generate_otp(
     ip_address: str,
     device_fingerprint: str,
     client_tier: str = "browser",
+    enable_watermark: bool = False,
 ) -> dict:
     if not VDOCIPHER_API_SECRET:
         raise ValueError("VDOCIPHER_API_SECRET is not configured")
@@ -104,7 +105,7 @@ async def generate_otp(
 
     body: dict = {"ttl": tier["ttl"]}
 
-    if tier["watermark"]:
+    if enable_watermark:
         watermark = _build_dynamic_watermark(user, device_fingerprint)
         body["annotate"] = json.dumps([watermark])
 

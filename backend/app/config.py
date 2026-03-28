@@ -61,3 +61,10 @@ RAPID_SESSION_CREATION_LIMIT = 5       # Max new sessions in 10 minutes
 RAPID_SESSION_CREATION_WINDOW = 600    # 10 minutes
 HEARTBEAT_GAP_TOLERANCE = 3            # Max missed heartbeats (90s gap) before flagging
 MIN_PLAY_RATIO = 0.3                   # play_seconds / elapsed_seconds — below 30% = suspicious
+
+# Seek proxy detection (pure server-side)
+# Compares client-reported play_seconds vs server-measured heartbeat gap
+PLAY_TIME_DRIFT_THRESHOLD = 0.5        # Flag if client/server time differ by >50%
+PLAY_TIME_DRIFT_MIN_SAMPLES = 3        # Need at least 3 heartbeats before flagging drift
+PLAY_TIME_VARIANCE_WINDOW = 6          # Track last 6 heartbeat deltas for variance check
+PLAY_TIME_VARIANCE_THRESHOLD = 150.0   # Std deviation threshold — normal is ~0-5, erratic seeking >15

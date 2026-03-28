@@ -2,7 +2,7 @@
 
 ## Overview
 
-FastAPI backend serving as the security layer between the frontend and VdoCipher's DRM video hosting. Implements multi-layered anti-piracy protection with PostgreSQL for persistent data and Redis for ephemeral/real-time data.
+FastAPI backend serving as the security layer between the frontend and VdoCipher's DRM video hosting. Implements multi-layered anti-piracy protection with PostgreSQL for persistent data and Redis for ephemeral/real-time data. All anomaly detection runs server-side — no reliance on client-reported behavioral events.
 
 ## How to Run
 
@@ -24,21 +24,29 @@ Frontend (Next.js :3000)
     │
     ├── Get Videos ─────────────→ /api/videos (requires auth)
     │
+    ├── Sync Videos ────────────→ POST /api/videos/sync (fetches from VdoCipher API)
+    │
     ├── Request Playback ───────→ /api/video/otp (requires auth)
-    │   [rate limit] → [anomaly detection] → [concurrent check] → [tier check] → VdoCipher API
+    │   [rate limit] → [concurrent check] → [tier check] → VdoCipher API
     │   ← otp + playbackInfo + session_id + tier + max_resolution
     │
     ├── Heartbeat (every 30s) ──→ /api/playback/heartbeat
-    │   Sends: session_id + playback_events (seek_count, restart_count, play_seconds)
-    │   Validates: IP binding + behavioral analysis
-    │   ← status + risk_level
+    │   Sends: session_id + playback_events (play_seconds = wall-clock elapsed)
+    │   Server runs: 8 anomaly signals, persists flags for watermark decisions
+    │   ← status + risk_level + debug (flags, watermark_active, play_ratio, etc.)
+    │
+    ├── OTP Rotation (every 90s) → POST /api/video/otp/rotate
+    │   Checks session_has_anomaly() → if flags exist, watermark injected into new OTP
+    │
+    ├── Debug Info ─────────────→ GET /api/playback/debug/{session_id}
+    │   ← session state + rate limits + risk score
     │
     └── End Session ────────────→ DELETE /api/playback/session/{id}
 
 Backend (FastAPI :8000)
     │
     ├── PostgreSQL (69.62.82.132:5432) — Users, Videos, Audit Logs
-    └── Redis (69.62.82.132:6379) — Sessions, Rate Limits, Risk Scores, Behavioral Data
+    └── Redis (69.62.82.132:6379) — Sessions, Rate Limits, Risk Scores, Signal Data
 ```
 
 ## Folder Structure
@@ -50,8 +58,8 @@ backend/
 │   ├── config.py            # All settings from env vars
 │   ├── api/                 # Route handlers (thin — delegate to core/services)
 │   │   ├── auth.py          # Login, logout, refresh, me
-│   │   ├── videos.py        # Video catalog endpoints
-│   │   ├── playback.py      # OTP generation, heartbeat, session management
+│   │   ├── videos.py        # Video catalog endpoints + VdoCipher sync
+│   │   ├── playback.py      # OTP generation, OTP rotation, heartbeat, session management, debug
 │   │   └── health.py        # Health check
 │   ├── core/                # Business logic
 │   │   ├── auth.py          # Token signing/verification, user auth (queries Postgres)
@@ -60,13 +68,25 @@ backend/
 │   ├── db/                  # Data layer
 │   │   ├── postgres.py      # SQLAlchemy async engine, table definitions (UserDB, VideoDB, AuditLogDB)
 │   │   ├── redis.py         # Redis async connection pool
-│   │   └── seed.py          # Seeds initial users + videos on first startup
+│   │   └── seed.py          # Seeds initial users on first startup
 │   ├── models/
 │   │   └── schemas.py       # Pydantic request/response models
 │   └── services/            # External integrations + domain logic
-│       ├── sessions.py      # Playback session CRUD (Redis hashes + sorted sets)
-│       ├── vdocipher.py     # VdoCipher OTP generation with tier-based controls
-│       └── videos.py        # Video CRUD (Postgres queries)
+│       ├── sessions.py      # Playback session CRUD, heartbeat with 8 server-side signals,
+│       │                    # session_has_anomaly() for watermark decisions
+│       ├── vdocipher.py     # VdoCipher OTP generation with conditional watermark + tier config
+│       └── videos.py        # Video CRUD (Postgres) + VdoCipher catalog sync
+├── tests/                   # Integration tests (require running backend + Redis + Postgres)
+│   ├── conftest.py          # Shared fixtures (auth, session creation, heartbeat helpers)
+│   ├── test_session_mgmt.py # Session reuse, concurrent limits, heartbeat, expiry
+│   ├── test_ip_detection.py # IP change detection and session termination
+│   ├── test_play_ratio.py   # Low play ratio detection
+│   ├── test_continuous_play.py # Continuous play hour detection
+│   ├── test_rapid_sessions.py  # Rapid session creation detection
+│   ├── test_seek_proxy.py   # Play-time drift and variance detection
+│   ├── test_combined_attacks.py # Multi-signal attack simulations
+│   └── test_rate_limiting.py    # Login and OTP rate limit tests
+├── pytest.ini
 ├── Dockerfile
 ├── requirements.txt
 └── .env                     # Environment variables (not committed)
@@ -77,14 +97,16 @@ backend/
 | Data | Store | Why |
 |------|-------|-----|
 | Users (email, password_hash, role) | **PostgreSQL** | Persistent, queryable, relational |
-| Videos (id, title, description) | **PostgreSQL** | Persistent catalog |
+| Videos (id, title, description) | **PostgreSQL** | Persistent catalog, synced from VdoCipher |
 | Audit Logs (event, user, ip, details) | **PostgreSQL** | Persistent, queryable for investigations |
 | Playback Sessions | **Redis** (hash + set) | Fast, auto-expires via TTL (90s) |
 | Rate Limits | **Redis** (sorted set) | Sliding window, auto-cleanup |
 | Risk Scores | **Redis** (sorted set + hash) | Decays after 1 hour |
 | Token Revocations | **Redis** (key with TTL) | Expires with token lifetime |
-| Behavioral Data (seeks, restarts) | **Redis** (sorted set per session) | Ephemeral, tied to session lifetime |
-| Request History (IPs, fingerprints) | **Redis** (list) | Rolling window for anomaly detection |
+| Session Creation Rate | **Redis** (sorted set per user) | Rapid creation detection, 10min window |
+| Ghost Session Tracking | **Redis** (sorted set per user) | Detect sessions that never heartbeat |
+| Play-Time Deltas | **Redis** (list per session) | Drift and variance detection (last 6 values) |
+| Session Flags | **Redis** (field in session hash) | Persisted anomaly flags for watermark decisions |
 
 ## API Routes
 
@@ -96,10 +118,13 @@ backend/
 | GET | `/api/auth/me` | Yes | Returns current user info. |
 | GET | `/api/videos` | Yes | Returns video catalog from Postgres. |
 | GET | `/api/videos/{id}` | Yes | Returns single video metadata. |
+| POST | `/api/videos/sync` | Yes | Fetches all videos from VdoCipher API and upserts into Postgres. |
 | POST | `/api/video/otp` | Yes | **Core endpoint.** Tier-aware OTP generation with all security layers. |
-| POST | `/api/playback/heartbeat` | Yes | Validates IP binding, analyzes behavioral events, refreshes session TTL. |
+| POST | `/api/video/otp/rotate` | Yes | Rotate OTP for active session. Checks `session_has_anomaly()` — enables watermark if flags exist. |
+| POST | `/api/playback/heartbeat` | Yes | Runs 8 server-side anomaly signals, persists flags, refreshes session TTL. |
 | DELETE | `/api/playback/session/{id}` | Yes | Ends a playback session. |
 | GET | `/api/playback/sessions` | Yes | Lists active sessions for user. |
+| GET | `/api/playback/debug/{id}` | Yes | Returns session state, rate limits, and risk score for debug panel. |
 | GET | `/api/health` | No | Health check (v3.0.0). |
 
 ## Module Details
@@ -133,20 +158,37 @@ backend/
 
 **Audit Logging:** Writes to both console (structured JSON) and Postgres `audit_logs` table.
 
-### `app/services/sessions.py` — Playback Sessions (Redis)
+### `app/services/sessions.py` — Playback Sessions & Server-Side Signals (Redis)
 
 **Redis keys per session:**
-- `session:{session_id}` — hash with session data (TTL: 90s, refreshed on heartbeat)
+- `session:{session_id}` — hash with session data + `flags` field (TTL: 90s, refreshed on heartbeat)
 - `user_sessions:{user_id}` — set of active session IDs
-- `seeks:{session_id}` — sorted set of seek event timestamps
-- `restarts:{session_id}` — sorted set of restart event timestamps
+- `session_creations:{user_id}` — sorted set of creation timestamps (rapid creation detection)
+- `ghost_check:{user_id}` — sorted set of sessions pending first heartbeat
+- `play_deltas:{session_id}` — list of recent play_seconds values (drift/variance detection)
 
 **IP Binding:** Heartbeat validates IP hasn't changed. 3+ IP changes → session killed.
 
-**Behavioral Detection (on heartbeat):**
-1. **Excessive Seeking** (>15/min): Detects ripping tools that seek through video
-2. **Rapid Restarts** (>10/hr): Detects automation scripts
-3. **Continuous Play** (>8h): Nobody watches 8 hours straight
+**8 Server-Side Signals (on every heartbeat):**
+1. **IP change detection** — Flags IP changes, kills session at 3+
+2. **Heartbeat gap detection** — Flags if gap > 75s (missed heartbeat), threshold: 3+ missed
+3. **Play ratio detection** — `total_play_seconds / session_age` < 0.3 after 2 min grace period
+4. **Continuous play** — Total play > 10 hours
+5. **Rapid session creation** — >5 new sessions in 10 minutes for the user
+6. **Ghost sessions** — 3+ sessions created with 0 heartbeats
+7. **OTP rotation abuse** — Actual rotations > 3x expected (based on session age / 90s interval)
+8. **Seek proxy detection** — Play-time drift (client vs server > 50% divergence) + erratic variance (std_dev > 150)
+
+**Risk level determination:**
+- 0 flags → `"normal"`
+- 1-2 flags → `"warning"` (flags persisted → triggers watermark on next OTP rotation)
+- 3+ flags → `"blocked"` (+25 risk points added to global user score)
+
+**Dynamic watermarking integration:**
+- Heartbeat persists `flags` field on session hash in Redis
+- `session_has_anomaly(session_id)` checks if flags exist
+- OTP rotation endpoint calls this before generating OTP — if anomaly present, watermark is enabled
+- Debug info includes `watermark_active: bool` field
 
 **Page Refresh Handling:** Same user+video+device reuses existing session instead of creating new one.
 
@@ -154,24 +196,29 @@ backend/
 
 **Tier-based OTP generation:**
 
-| Tier | OTP TTL | Max Resolution | Watermark |
-|------|---------|---------------|-----------|
-| `browser` | 120s | 480p | Yes |
-| `mobile_app` | 300s | 1080p | Yes |
-| `smart_tv` | 300s | 4K | Yes |
+| Tier | OTP TTL | Max Resolution |
+|------|---------|---------------|
+| `browser` | 120s | 480p |
+| `mobile_app` | 300s | 1080p |
+| `smart_tv` | 300s | 4K |
 
-**Dynamic Forensic Watermark:**
-- 10% opacity (near-invisible to viewers)
-- Moves every 3 seconds (harder to crop out)
-- Contains: `userId|timestamp|deviceFingerprint`
+**Anomaly-Triggered Forensic Watermark:**
+- Watermark is OFF by default — enabled only when `enable_watermark=True` is passed
+- OTP rotation checks `session_has_anomaly()` and passes the result to `generate_otp()`
+- When active: 10% opacity, moves every 3 seconds, contains `userId|timestamp|deviceFingerprint`
 - Survives re-encoding and cropping
+
+**Video Catalog Sync:**
+- `fetch_all_videos_from_vdocipher()` paginates through VdoCipher API (`/videos?page=N&limit=20`)
+- Only includes videos with `status: "ready"` (fully processed)
+- `sync_videos_from_vdocipher()` upserts into Postgres (adds new, updates existing, sets `is_active=True`)
 
 **OTP parameters sent to VdoCipher:**
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `ttl` | 120s (browser) / 300s (mobile) | Prevents token sharing |
-| `annotate` | Dynamic watermark | Forensic tracing of leaks |
+| `annotate` | Dynamic watermark (only if anomaly detected) | Forensic tracing of leaks |
 | `userId` | user_id (max 36 chars) | VdoCipher viewer analytics |
 | `whitelisthref` | production domain | Blocks playback on pirate sites |
 
@@ -185,7 +232,8 @@ backend/
 
 On first startup (tables empty), seeds:
 - 2 users: `viewer@example.com` / `demo123`, `admin@example.com` / `admin123`
-- 1 video: VdoCipher video ID `bd3ca7a235663ed1570e305f3775414a`
+
+Videos are synced from VdoCipher via `POST /api/videos/sync` — no longer hardcoded in seed.
 
 ## Security Layers (applied on every OTP request)
 
@@ -194,14 +242,36 @@ Request arrives at POST /api/video/otp
     │
     ├── Layer 1: Authentication (Bearer token + device binding)
     ├── Layer 2: Rate Limiting (10 req/min per user — Redis)
-    ├── Layer 3: Anomaly Detection (impossible travel, fingerprint abuse — Redis)
-    ├── Layer 4: Concurrent Stream Limit (max 2 active sessions — Redis)
-    ├── Layer 5: Tier-Based Controls (browser=480p/120s, mobile=1080p/300s)
-    ├── Layer 6: Dynamic Forensic Watermark (10% opacity, moves every 3s)
-    └── Layer 7: Behavioral Monitoring (seeks, restarts, continuous play — Redis)
+    ├── Layer 3: Concurrent Stream Limit (max 2 active sessions — Redis)
+    ├── Layer 4: Tier-Based Controls (browser=480p/120s, mobile=1080p/300s)
+    └── Layer 5: Session created — heartbeat monitoring begins
     │
     ← Returns: otp + playbackInfo + session_id + tier + max_resolution
+
+During playback (every heartbeat):
+    │
+    ├── Layer 6: 8 Server-Side Anomaly Signals (IP, gaps, ratio, drift, etc.)
+    ├── Layer 7: Flag persistence → triggers dynamic watermark on next OTP rotation
+    └── Layer 8: Risk score escalation at 3+ simultaneous flags
 ```
+
+## Configuration Reference
+
+### Server-Side Signal Thresholds (`config.py`)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `MAX_CONTINUOUS_PLAY_HOURS` | 10 | Continuous play flag threshold |
+| `RAPID_SESSION_CREATION_LIMIT` | 5 | Max new sessions per window |
+| `RAPID_SESSION_CREATION_WINDOW` | 600 (10 min) | Window for rapid creation detection |
+| `GHOST_SESSION_THRESHOLD` | 3 | Sessions with 0 heartbeats before flagging |
+| `MIN_PLAY_RATIO` | 0.3 | Minimum play_seconds/session_age ratio |
+| `HEARTBEAT_GAP_TOLERANCE` | 3 | Missed heartbeats before flagging |
+| `PLAY_TIME_DRIFT_THRESHOLD` | 0.5 | Client vs server time divergence (50%) |
+| `PLAY_TIME_DRIFT_MIN_SAMPLES` | 3 | Heartbeats needed before flagging drift |
+| `PLAY_TIME_VARIANCE_WINDOW` | 6 | Number of recent deltas for variance check |
+| `PLAY_TIME_VARIANCE_THRESHOLD` | 150.0 | Std deviation threshold for erratic playback |
+| `BEHAVIORAL_RISK_POINTS` | 25 | Points added when session is "blocked" |
 
 ## Environment Variables
 

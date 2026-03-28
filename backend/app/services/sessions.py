@@ -3,6 +3,8 @@ import time
 
 from fastapi import HTTPException
 
+import math
+
 from app.config import (
     MAX_CONCURRENT_STREAMS,
     SESSION_EXPIRY,
@@ -13,6 +15,10 @@ from app.config import (
     MIN_PLAY_RATIO,
     HEARTBEAT_GAP_TOLERANCE,
     BEHAVIORAL_RISK_POINTS,
+    PLAY_TIME_DRIFT_THRESHOLD,
+    PLAY_TIME_DRIFT_MIN_SAMPLES,
+    PLAY_TIME_VARIANCE_WINDOW,
+    PLAY_TIME_VARIANCE_THRESHOLD,
 )
 from app.db.redis import get_redis
 
@@ -173,16 +179,47 @@ async def heartbeat(
         if otp_rotations > max(10, expected_rotations * 3):
             flags.append(f"rotation_abuse:{otp_rotations}")
 
+    # ── Server-side signal #8: Seek proxy detection (play-time drift & variance) ──
+    # Compare client-reported play_seconds vs server-measured heartbeat gap.
+    # Also track variance of play_seconds across heartbeats — erratic values
+    # indicate seeking/scrubbing even when individual deltas look plausible.
+    drift_key = f"play_deltas:{session_id}"
+    drift_count = int(session.get("drift_count", 0))
+
+    if play_delta > 0:
+        # Drift detection: client says X seconds but server measured Y seconds gap
+        drift_ratio = abs(play_delta - gap) / max(gap, play_delta, 1)
+        if drift_ratio > PLAY_TIME_DRIFT_THRESHOLD:
+            drift_count += 1
+            await r.hset(f"session:{session_id}", "drift_count", str(drift_count))
+        if drift_count >= PLAY_TIME_DRIFT_MIN_SAMPLES:
+            flags.append(f"play_time_drift:{drift_count}")
+
+        # Variance detection: store recent play_seconds, check for erratic pattern
+        await r.rpush(drift_key, str(play_delta))
+        await r.ltrim(drift_key, -PLAY_TIME_VARIANCE_WINDOW, -1)
+        await r.expire(drift_key, SESSION_EXPIRY)
+
+        raw_deltas = await r.lrange(drift_key, 0, -1)
+        deltas = [float(d) for d in raw_deltas]
+        if len(deltas) >= PLAY_TIME_DRIFT_MIN_SAMPLES:
+            mean = sum(deltas) / len(deltas)
+            variance = sum((d - mean) ** 2 for d in deltas) / len(deltas)
+            std_dev = math.sqrt(variance)
+            if std_dev > PLAY_TIME_VARIANCE_THRESHOLD:
+                flags.append(f"erratic_playback:{std_dev:.1f}")
+
     # ── Determine risk level ──
     risk_level = "normal"
     if flags:
         risk_level = "warning" if len(flags) < 3 else "blocked"
 
-    # Update heartbeat tracking
+    # Update heartbeat tracking + persist flags for watermark decisions
     hb_count = int(session.get("heartbeat_count", 0)) + 1
     pipe = r.pipeline()
     pipe.hset(f"session:{session_id}", "last_heartbeat", str(now))
     pipe.hset(f"session:{session_id}", "heartbeat_count", str(hb_count))
+    pipe.hset(f"session:{session_id}", "flags", ",".join(flags) if flags else "")
     pipe.expire(f"session:{session_id}", SESSION_EXPIRY)
     await pipe.execute()
 
@@ -200,10 +237,21 @@ async def heartbeat(
         "play_ratio": round(total_play / session_age, 2) if session_age > 0 else 1.0,
         "recent_session_creations": recent_creations,
         "ghost_sessions": ghost_count,
+        "drift_count": drift_count,
         "flags": flags,
+        "watermark_active": bool(flags),
     }
 
     return {"status": "alive", "expires_in": SESSION_EXPIRY, "risk_level": risk_level, "debug": debug}
+
+
+async def session_has_anomaly(session_id: str) -> bool:
+    """Check if a session currently has any anomaly flags."""
+    session = await _get_session(session_id)
+    if not session:
+        return False
+    flags = session.get("flags", "")
+    return bool(flags and flags.strip())
 
 
 async def validate_session_for_rotation(

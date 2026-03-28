@@ -31,6 +31,7 @@ from app.services.sessions import (
     end_session,
     get_user_sessions,
     validate_session_for_rotation,
+    session_has_anomaly,
 )
 from app.services.videos import get_video_by_id
 from app.services.vdocipher import generate_otp
@@ -114,8 +115,11 @@ async def rotate_otp(
 
     client_tier = session.get("client_tier", "browser")
 
+    # Enable watermark if session has anomaly flags
+    watermark = await session_has_anomaly(body.session_id)
+
     try:
-        otp_data = await generate_otp(body.video_id, user, ip, fingerprint, client_tier)
+        otp_data = await generate_otp(body.video_id, user, ip, fingerprint, client_tier, enable_watermark=watermark)
         await audit_log(
             "OTP_ROTATED",
             user_id=user.user_id,
@@ -124,6 +128,7 @@ async def rotate_otp(
                 "video_id": body.video_id,
                 "session_id": body.session_id,
                 "rotation_count": session.get("otp_rotations", 0),
+                "watermark_enabled": watermark,
             },
         )
         rotation_interval = (

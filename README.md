@@ -166,16 +166,27 @@ Browsers use **Widevine L3** (software decryption, insecure). Mobile apps use **
 
 ### 4. Dynamic Forensic Watermarking
 
-Every OTP request embeds an invisible watermark into the video stream:
+Watermarking is **anomaly-triggered** — watermarks are OFF by default and automatically enabled when the system detects suspicious behavior during playback.
 
 ```
-Watermark content: "{user_id}|{timestamp}|{device_fingerprint}"
-Properties:
-  - 10% opacity (invisible during normal viewing)
-  - White color, 12pt font
-  - Moves position every 3 seconds
-  - Survives re-encoding, cropping, and screen recording
+Normal playback → No watermark (clean viewing experience)
+    ↓
+Anomaly detected (IP change, low play ratio, drift, etc.)
+    ↓
+Flags stored on session in Redis
+    ↓
+Next OTP rotation (~90s) checks flags → Watermark ON
+    ↓
+Watermark embeds: "{user_id}|{timestamp}|{device_fingerprint}"
 ```
+
+**Watermark properties (when active):**
+- 10% opacity (near-invisible during normal viewing)
+- White color, 12pt font
+- Moves position every 3 seconds
+- Survives re-encoding, cropping, and screen recording
+
+**How it activates:** Every heartbeat (30s) runs 8 server-side anomaly signals. If any flag is raised, the `flags` field is persisted on the session in Redis. On the next OTP rotation, `session_has_anomaly()` checks this field — if flags exist, the watermark is injected into the new OTP. Once flags clear (no anomalies on subsequent heartbeats), the next rotation issues a clean OTP without watermark.
 
 If pirated content surfaces, the watermark identifies **who** leaked it, **when**, and from **which device**.
 
@@ -197,27 +208,31 @@ Sessions expire if no heartbeat is received within **90 seconds** (auto-cleanup 
 
 ---
 
-### 6. Behavioral Anomaly Detection
+### 6. Server-Side Anomaly Detection
 
-The frontend tracks playback events and sends them with every heartbeat (every 30 seconds):
+All anomaly detection runs **server-side** during heartbeat processing — no reliance on client-reported behavioral events. The frontend sends `play_seconds` (wall-clock elapsed time since last heartbeat) and the backend cross-references this against its own measurements.
 
-```javascript
-{
-  seek_count: 2,      // how many times user skipped
-  restart_count: 0,   // how many times video restarted
-  play_seconds: 30    // seconds of video actually played
-}
+**8 server-side signals checked on every heartbeat:**
+
+| # | Signal | Threshold | What It Detects |
+|---|--------|-----------|-----------------|
+| 1 | **IP change** | 3+ changes → session killed | Token/session sharing, VPN switching |
+| 2 | **Heartbeat gaps** | 3+ missed heartbeats (75s+ gap) | Scripts holding sessions without real playback |
+| 3 | **Low play ratio** | `play_seconds / session_age < 0.3` | Script downloads segments while barely "playing" |
+| 4 | **Continuous play** | >10 hours nonstop | No human watches 10h+ — likely a bot |
+| 5 | **Rapid session creation** | >5 sessions in 10 minutes | Automated ripping creating many sessions |
+| 6 | **Ghost sessions** | 3+ sessions with 0 heartbeats | Session harvesting without actual playback |
+| 7 | **OTP rotation abuse** | >3x expected rotations | Rapid OTP harvesting for parallel decryption |
+| 8 | **Seek proxy detection** | Play-time drift >50% or erratic variance | Client-reported time doesn't match server-measured gap |
+
+**Risk level per heartbeat:**
+```
+0 flags    → "normal"  — playback continues
+1-2 flags  → "warning" — logged, watermark activated on next OTP rotation
+3+ flags   → "blocked" — +25 risk points added, session flagged
 ```
 
-The backend analyzes these for piracy patterns:
-
-| Behavior | Threshold | Risk Points | Why Suspicious |
-|----------|-----------|-------------|----------------|
-| Excessive seeking | >30 seeks/minute | +25 | Ripping tools scrub through video fast |
-| Rapid restarts | >15 restarts/hour | +25 | Automation scripts restart for fresh DRM keys |
-| Continuous play | >10 hours nonstop | +25 | No human watches 10h+ — likely a bot |
-
-**Risk Score System:**
+**Global risk score system:**
 ```
 0-49 points   → "normal"  — playback continues
 50-99 points  → "warning" — logged, playback continues
@@ -227,9 +242,9 @@ Points decay after 1 hour → legitimate users recover
 
 **Escalation:** Risk points are only added to the global user score when the heartbeat returns `"blocked"` (3+ simultaneous flags). Warnings are logged but don't accumulate risk — this prevents false positives during normal viewing.
 
-**Tuning notes:** Thresholds are intentionally generous to avoid blocking legitimate viewers. A normal viewer will never hit 30 seeks in a minute — that's physically someone dragging the scrubber non-stop. Only automated ripping tools produce these patterns.
+**Dynamic watermarking:** When any flag is raised, the session's `flags` field is persisted in Redis. On the next OTP rotation (~90s), the system checks for active flags and injects a forensic watermark into the new OTP if anomalies are present.
 
-**Storage:** Seek timestamps, restart timestamps, and play duration are stored as Redis sorted sets with automatic expiry. Only the last 2 minutes of seeks and last 1 hour of restarts are retained.
+**Storage:** Session signals are stored in Redis hashes per session with auto-expiry. Play-time deltas for variance detection are stored in Redis lists (`play_deltas:{session_id}`). Session creation rates tracked via sorted sets (`session_creations:{user_id}`).
 
 ---
 
@@ -469,6 +484,7 @@ src/
 |--------|----------|-------------|:---:|
 | GET | `/api/videos` | List all active videos | Yes |
 | GET | `/api/videos/{id}` | Get single video details | Yes |
+| POST | `/api/videos/sync` | Sync video catalog from VdoCipher API | Yes |
 
 ### Playback Control
 
@@ -479,6 +495,7 @@ src/
 | POST | `/api/playback/heartbeat` | Send heartbeat + behavioral events | Yes |
 | DELETE | `/api/playback/session/{id}` | End a playback session | Yes |
 | GET | `/api/playback/sessions` | List user's active sessions | Yes |
+| GET | `/api/playback/debug/{id}` | Get debug info for a session | Yes |
 
 ### Health
 
@@ -529,13 +546,14 @@ src/
 
 | Key Pattern | Type | TTL | Purpose |
 |------------|------|-----|---------|
-| `session:{session_id}` | Hash | 90s | Active playback session data |
+| `session:{session_id}` | Hash | 90s | Active playback session data (incl. `flags` for watermark decisions) |
 | `user_sessions:{user_id}` | Set | — | Set of active session IDs |
-| `seeks:{session_id}` | Sorted Set | 120s | Seek timestamps (last 2 min) |
-| `restarts:{session_id}` | Sorted Set | 3600s | Restart timestamps (last 1 hr) |
+| `session_creations:{user_id}` | Sorted Set | 660s | Session creation timestamps (rapid creation detection) |
+| `ghost_check:{user_id}` | Sorted Set | 180s | Sessions pending first heartbeat (ghost detection) |
+| `play_deltas:{session_id}` | List | 90s | Recent play_seconds values (variance/drift detection) |
 | `risk:{user_id}` | String | 3600s | Accumulated risk score |
-| `rate:login:{ip}` | Sorted Set | 900s | Login attempt timestamps |
-| `rate:otp:{user_id}` | Sorted Set | 60s | OTP request timestamps |
+| `ratelimit:login:{ip}` | Sorted Set | 900s | Login attempt timestamps |
+| `ratelimit:otp:{user_id}` | Sorted Set | 60s | OTP request timestamps |
 | `revoked:{token_hash}` | String | token TTL | Revoked token marker |
 
 ---
@@ -736,9 +754,9 @@ If your frontend is on HTTPS (Vercel) and backend is on HTTP, the Next.js rewrit
 | **Encryption** | Widevine L3 / FairPlay | VdoCipher CDN |
 | **Token Security** | Short-lived, rotating OTPs | 120s TTL, 90s rotation |
 | **Resolution** | Tier-based capping | Browser=480p, Mobile=1080p |
-| **Watermarking** | Forensic user+device ID | Dynamic, 10% opacity |
+| **Watermarking** | Anomaly-triggered forensic ID | Activates on anomaly, embeds user+device+timestamp |
 | **Streams** | Concurrent limit | Max 2 per user |
-| **Behavior** | Anomaly detection | Seeks, restarts, duration |
+| **Behavior** | 8 server-side signals | IP, gaps, ratio, drift, ghosts, rotation abuse |
 | **Network** | IP binding | 3+ changes = session killed |
 | **Device** | Fingerprint binding | Token-bound, max 5 devices |
 | **Rate Limits** | Sliding window | Login, OTP, license endpoints |

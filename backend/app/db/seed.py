@@ -19,14 +19,52 @@ SEED_USERS = [
         "password": "admin123",
         "role": "admin",
     },
+    {
+        "id": "user-003",
+        "email": "tester1@example.com",
+        "name": "Tester One",
+        "password": "test123",
+        "role": "viewer",
+    },
+    {
+        "id": "user-004",
+        "email": "tester2@example.com",
+        "name": "Tester Two",
+        "password": "test123",
+        "role": "viewer",
+    },
+    {
+        "id": "user-005",
+        "email": "tester3@example.com",
+        "name": "Tester Three",
+        "password": "test123",
+        "role": "viewer",
+    },
+    {
+        "id": "user-006",
+        "email": "tester4@example.com",
+        "name": "Tester Four",
+        "password": "test123",
+        "role": "viewer",
+    },
+    {
+        "id": "user-007",
+        "email": "tester5@example.com",
+        "name": "Tester Five",
+        "password": "test123",
+        "role": "viewer",
+    },
 ]
 
 
 async def seed_database():
     async with async_session() as session:
-        existing = await session.execute(select(UserDB).limit(1))
-        if not existing.scalar_one_or_none():
-            for u in SEED_USERS:
+        added = 0
+        for u in SEED_USERS:
+            existing = await session.execute(
+                select(UserDB).where(UserDB.email == u["email"])
+            )
+            if not existing.scalar_one_or_none():
                 user = UserDB(
                     id=u["id"],
                     email=u["email"],
@@ -35,10 +73,12 @@ async def seed_database():
                     role=u["role"],
                 )
                 session.add(user)
+                added += 1
+        if added:
             await session.commit()
-            print(f"Seeded {len(SEED_USERS)} users")
+            print(f"Seeded {added} new users")
         else:
-            print("Users already exist, skipping seed")
+            print("All users already exist, skipping seed")
 
     # Sync videos from VdoCipher
     try:
